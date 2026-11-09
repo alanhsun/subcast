@@ -1,0 +1,23 @@
+# Local runtime caches & toolchains
+.git/
+.github/
+.pytest_cache/
+.toolchain/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Exclude local 1GB+ downloaded models from Docker context (downloaded at runtime or via BUILD_WITH_MODELS)
+models/
+
+# Exclude private settings (API keys) and uncompressed EPG from image
+data/settings.json
+data/epg.xml
+data/playlist.m3u
+data/playlist.txt
+
+# Android build caches
+android-tv-client/.gradle/
+android-tv-client/build/
+android-tv-client/app/build/

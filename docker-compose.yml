@@ -1,0 +1,23 @@
+services:
+  subcast:
+    image: ${DOCKERHUB_USER:-alansundy}/subcast:latest
+    build: .
+    container_name: subcast
+    restart: unless-stopped
+    # 推荐使用 host 网络模式：支持电视端 APK 局域网 UDP 零配置自动发现，并自动获取 Unraid 局域网 IP
+    network_mode: host
+    environment:
+      - TZ=Asia/Shanghai
+      - HF_ENDPOINT=https://hf-mirror.com
+      - LINGUARELAY_PORT=8765
+      - LINGUARELAY_UDP_PORT=8766
+      # 若在 Unraid 中改用 bridge 桥接模式，请在此填写 Unraid 宿主机 IP（例如 10.10.10.80）
+      - LINGUARELAY_HOST_IP=
+      # 可选：首次启动预设大模型配置（也可启动后在 http://<Unraid-IP>:8765 网页端可视化配置并持久化）
+      - LINGUARELAY_LLM_BASE_URL=https://api.minimaxi.com/v1
+      - LINGUARELAY_LLM_API_KEY=
+      - LINGUARELAY_LLM_MODEL=MiniMax-M3.1-Flash
+    volumes:
+      # Unraid NAS 持久化目录映射（首次启动会自动释放内置 337 频道源与 EPG，并下载 Qwen3-ASR 模型）
+      - /mnt/user/appdata/lingua-relay-tv/models:/app/models
+      - /mnt/user/appdata/lingua-relay-tv/data:/app/data

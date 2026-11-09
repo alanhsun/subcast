@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>subcast</Name>
+  <Repository>alansundy/subcast:latest</Repository>
+  <Registry>https://hub.docker.com/r/alansundy/subcast</Registry>
+  <Network>host</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Project>https://github.com/alanhsun/subcast</Project>
+  <Overview>声幕 SubCast (v2.4) — 面向影视仓 (TVBox)、Jellyfin 与 Android TV 的零损国际直播实时同传字幕网关（内置 Qwen3-ASR-0.6B 30 语种识别 + MiniMax/DeepSeek 上下文翻译 + 337 频道台标与 EPG 节目单）。</Overview>
+  <Category>MediaServer:Video MediaApp:Video</Category>
+  <WebUI>http://[IP]:[PORT:8765]/</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/alanhsun/subcast/main/assets/logo.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="Web 控制台与代理端口" Target="LINGUARELAY_PORT" Default="8765" Mode="" Description="Web 控制台、M3U/EPG 订阅与 HLS 流代理端口" Type="Variable" Display="always" Required="true" Mask="false">8765</Config>
+  <Config Name="电视端 UDP 自动发现端口" Target="LINGUARELAY_UDP_PORT" Default="8766" Mode="" Description="Android TV 悬浮字幕端局域网零配置发现端口" Type="Variable" Display="always" Required="true" Mask="false">8766</Config>
+  <Config Name="Unraid 局域网 IP (Bridge 模式必填)" Target="LINGUARELAY_HOST_IP" Default="10.10.10.80" Mode="" Description="Host 模式下可留空自动识别；若使用 Bridge 模式请填写 Unraid 局域网 IP（如 10.10.10.80）" Type="Variable" Display="always" Required="false" Mask="false">10.10.10.80</Config>
+  <Config Name="HuggingFace 国内镜像源" Target="HF_ENDPOINT" Default="https://hf-mirror.com" Mode="" Description="首次启动自动下载 Qwen3-ASR 离线模型使用的加速镜像" Type="Variable" Display="advanced" Required="false" Mask="false">https://hf-mirror.com</Config>
+  <Config Name="大模型 API Base URL" Target="LINGUARELAY_LLM_BASE_URL" Default="https://api.minimaxi.com/v1" Mode="" Description="默认翻译大模型接口地址（也可在 Web 控制台内随时切换并保存）" Type="Variable" Display="always" Required="false" Mask="false">https://api.minimaxi.com/v1</Config>
+  <Config Name="大模型 API Key" Target="LINGUARELAY_LLM_API_KEY" Default="" Mode="" Description="MiniMax 或 DeepSeek API Key（也可留空，启动后在 Web 控制台内填入保存）" Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="大模型名称" Target="LINGUARELAY_LLM_MODEL" Default="MiniMax-M3.1-Flash" Mode="" Description="默认翻译模型名称（MiniMax-M3.1-Flash / MiniMax-M3 / deepseek-chat）" Type="Variable" Display="always" Required="false" Mask="false">MiniMax-M3.1-Flash</Config>
+  <Config Name="模型持久化目录 (Models)" Target="/app/models" Default="/mnt/user/appdata/subcast/models" Mode="rw" Description="存放 Qwen3-ASR-0.6B、Silero-VAD 与 CTranslate2 离线模型（首次启动自动下载并持久化）" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/subcast/models</Config>
+  <Config Name="配置与直播源目录 (Data)" Target="/app/data" Default="/mnt/user/appdata/subcast/data" Mode="rw" Description="存放自定义直播源 playlist_source.txt、EPG 节目单与网页端保存的 settings.json" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/subcast/data</Config>
+</Container>

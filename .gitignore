@@ -1,0 +1,23 @@
+# Python & Test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local Toolchain & Models (downloaded automatically by scripts/download_models.py)
+.toolchain/
+models/
+
+# Private runtime settings (contains LLM API Key — never commit to GitHub!)
+data/settings.json
+data/epg.xml
+data/playlist.m3u
+data/playlist.txt
+
+# Android build intermediates
+android-tv-client/.gradle/
+android-tv-client/local.properties
+android-tv-client/build/
+android-tv-client/app/build/
+dist/*.idsig
