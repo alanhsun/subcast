@@ -138,8 +138,12 @@ http://1.2.3.4/lovenature.m3u8
     assert by_name["Sky News天空新闻"].need_translate is True
     assert by_name["Love Nature 4K"].need_translate is True
 
-    m3u_all = export_m3u(channels, "http://10.10.10.80:8765")
-    assert 'x-tvg-url="http://10.10.10.80:8765/epg.xml.gz' in m3u_all
+    m3u_all = export_m3u(
+        channels,
+        "http://10.10.10.80:8765",
+        extra_epg_url="https://epg.112114.xyz/pp.xml.gz",
+    )
+    assert 'x-tvg-url="http://10.10.10.80:8765/epg.xml.gz,http://10.10.10.80:8765/epg.xml,https://epg.112114.xyz/pp.xml.gz"' in m3u_all
 
     m3u_foreign = export_m3u(channels, "http://10.10.10.80:8765", only_foreign=True)
     assert "CCTV1" not in m3u_foreign
@@ -158,6 +162,21 @@ def test_epg_and_foreign_playlist_routes() -> None:
         r_epg_gz = client.get("/epg.xml.gz")
         assert r_epg_gz.status_code == 200
         assert len(r_epg_gz.content) > 1000
+
+        r_diyp = client.get("/epg?ch=CCTV1")
+        assert r_diyp.status_code == 200
+        diyp_json = r_diyp.json()
+        assert diyp_json["channel_name"] == "CCTV1"
+        assert isinstance(diyp_json["epg_data"], list)
+        assert len(diyp_json["epg_data"]) > 0
+
+        r_logo_svg = client.get("/logo.svg")
+        assert r_logo_svg.status_code == 200
+        assert "<svg" in r_logo_svg.text
+
+        r_logo_png = client.get("/logo.png")
+        assert r_logo_png.status_code == 200
+        assert len(r_logo_png.content) > 1000
 
         r_foreign = client.get("/playlist_foreign.m3u")
         assert r_foreign.status_code == 200

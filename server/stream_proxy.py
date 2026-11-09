@@ -1,7 +1,7 @@
 """
-Stream pass-through proxy (HLS .m3u8 & HTTP-TS) and single-instance FFmpeg AudioSidecarTap.
+Stream pass-through proxy (HLS .m3u8 & HTTP-TS) and single-instance FFmpeg AudioSidecarTap for 声幕 SubCast.
 Automatically tracks the currently watched channel on the TV, extracts 16kHz mono PCM
-audio in the background, runs the local AI subtitle pipeline (Silero-VAD + SenseVoice-Small
+audio in the background, runs the local AI subtitle pipeline (Silero-VAD + Qwen3-ASR-0.6B
 + LLM Context Translator), and broadcasts subtitles with configurable delay compensation.
 """
 
@@ -93,7 +93,7 @@ class SidecarStatus:
     display_mode: str  # "bilingual" | "zh_only"
     last_touch_ago_sec: float
     total_subtitles_emitted: int
-    asr_engine: str = "Silero-VAD + SenseVoice-Small"
+    asr_engine: str = "Silero-VAD + Qwen3-ASR-0.6B"
     translation_engine: str = "CTranslate2"
     llm_ready: bool = False
     llm_error: str = ""
@@ -346,7 +346,7 @@ class AudioSidecarManager:
                 "event": "channel_switch",
                 "channel": channel_name,
                 "en": f"Listening: {channel_name}",
-                "zh": f"声桥已接入频道：{channel_name}",
+                "zh": f"声幕已接入频道：{channel_name}",
                 "is_final": True,
                 "display_mode": self.display_mode,
             },

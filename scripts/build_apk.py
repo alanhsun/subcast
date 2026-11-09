@@ -1,5 +1,5 @@
 """
-Self-contained Android TV APK compiler for LinguaRelay-TV (声桥 TV 版).
+Self-contained Android TV APK compiler for 声幕 SubCast (v2.4).
 Automatically provisions portable OpenJDK 17, Android build-tools (aapt2, d8, zipalign, apksigner),
 Android platform android.jar, and platform-tools (adb.exe) into `.toolchain/`, then builds and signs
 `dist/lingua-relay-tv.apk`.

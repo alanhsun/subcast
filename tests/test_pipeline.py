@@ -8,7 +8,18 @@ import numpy as np
 from server.ai_pipeline import StreamingSpeechPipeline
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-TEST_WAV = ROOT_DIR / "models" / "asr" / "test_en.wav"
+TEST_WAV = next(
+    (
+        p
+        for p in (
+            ROOT_DIR / "models" / "qwen3_asr" / "test_en.wav",
+            ROOT_DIR / "models" / "sensevoice" / "test_en.wav",
+            ROOT_DIR / "models" / "asr" / "test_en.wav",
+        )
+        if p.exists()
+    ),
+    ROOT_DIR / "models" / "qwen3_asr" / "test_en.wav",
+)
 
 
 def test_streaming_speech_pipeline_end_to_end() -> None:

@@ -34,4 +34,4 @@ Write-Host "[4/4] Granting SYSTEM_ALERT_WINDOW & APP_AUTO_START permissions..." 
 & $Adb -s "$TvIp`:5555" shell cmd appops set com.shengqiao.tv APP_AUTO_START allow
 & $Adb -s "$TvIp`:5555" shell am start -n com.shengqiao.tv/.MainActivity
 
-Write-Host "=== Done! LinguaRelay-TV is running on $TvIp ===" -ForegroundColor Green
+Write-Host "=== Done! 声幕 SubCast is running on $TvIp ===" -ForegroundColor Green

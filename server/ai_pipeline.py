@@ -1,10 +1,10 @@
 """
-Local & Hybrid AI Pipeline v2 for LinguaRelay-TV (声桥 TV 版):
+Local & Hybrid AI Pipeline v2.4 for 声幕 SubCast:
 1. VAD: Silero-VAD (natural pause detection & speech segmentation)
-2. ASR (Primary): Alibaba SenseVoice-Small (multilingual zh/en/ja/ko/yue int8, noise-robust, native punctuation & ITN)
-3. ASR (Fallback): sherpa-onnx Streaming Zipformer + Edge-Punct-Casing
-4. Translation (Primary): Context-Aware External LLM API (DeepSeek / SiliconFlow / Gemini / OpenAI-compatible)
-   with a 4-sentence sliding context window to auto-correct homophone ASR errors and produce natural TV subtitles.
+2. ASR (Primary): Alibaba Qwen3-ASR-0.6B (30 languages + 22 dialects int8, native punctuation & ITN)
+3. ASR (Fallback): SenseVoice-Small / sherpa-onnx Streaming Zipformer + Edge-Punct-Casing
+4. Translation (Primary): Context-Aware External LLM API (MiniMax / DeepSeek / OpenAI-compatible)
+   with a 6-sentence sliding context window to auto-correct homophone ASR errors and produce natural TV subtitles.
 5. Translation (Fallback): Offline CTranslate2 (int8) + SentencePiece when no API key is configured.
 """
 

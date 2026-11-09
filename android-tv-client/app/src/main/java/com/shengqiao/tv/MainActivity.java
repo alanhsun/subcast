@@ -76,7 +76,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, dp(28), pad, dp(28));
 
         TextView title = new TextView(this);
-        title.setText("声桥 TV");
+        title.setText("声幕 SubCast");
         title.setTextColor(Color.parseColor("#F4F4F5"));
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f);
         title.setTypeface(Typeface.DEFAULT_BOLD);

@@ -126,7 +126,7 @@ public class SubtitleOverlayService extends Service {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel chan = new NotificationChannel(
                     channelId,
-                    "声桥 TV 实时字幕服务",
+                    "声幕 SubCast 实时字幕服务",
                     NotificationManager.IMPORTANCE_LOW
             );
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
@@ -134,14 +134,14 @@ public class SubtitleOverlayService extends Service {
                 nm.createNotificationChannel(chan);
             }
             Notification notif = new Notification.Builder(this, channelId)
-                    .setContentTitle("声桥 TV 实时字幕运行中")
+                    .setContentTitle("声幕 SubCast 实时字幕运行中")
                     .setContentText("正在监听直播流双语字幕")
                     .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                     .build();
             startForeground(1001, notif);
         } else {
             Notification notif = new Notification.Builder(this)
-                    .setContentTitle("声桥 TV 实时字幕运行中")
+                    .setContentTitle("声幕 SubCast 实时字幕运行中")
                     .setContentText("正在监听直播流双语字幕")
                     .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                     .build();
@@ -238,8 +238,8 @@ public class SubtitleOverlayService extends Service {
                 isConnected = true;
                 currentStatusText = "已连接网关 (" + hostPort + ")";
                 mainHandler.post(() -> showSubtitleOnUi(
-                        "LinguaRelay-TV Connected",
-                        "声桥 TV 字幕已就绪 (" + hostPort + ")",
+                        "SubCast Connected",
+                        "声幕 SubCast 字幕已就绪 (" + hostPort + ")",
                         true,
                         4000
                 ));

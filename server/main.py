@@ -1,6 +1,6 @@
 """
-FastAPI Gateway, Web Console v2 (with SenseVoice + LLM API configuration),
-WebSocket Broadcaster, and UDP Auto-Discovery Server for LinguaRelay-TV (声桥 TV 版).
+FastAPI Gateway, Web Console v2.4 (with Qwen3-ASR-0.6B + LLM API + Online EPG Sync),
+WebSocket Broadcaster, and UDP Auto-Discovery Server for 声幕 SubCast.
 """
 
 from __future__ import annotations
@@ -228,7 +228,7 @@ async def lifespan(app: FastAPI):
         udp_transport.close()
 
 
-app = FastAPI(title="声桥 TV 版 v2 (LinguaRelay-TV)", lifespan=lifespan)
+app = FastAPI(title="声幕 SubCast v2.4 — Broadcast AI Subtitle Gateway", lifespan=lifespan)
 
 
 def _resolve_base_url(request: Request) -> str:
@@ -420,7 +420,7 @@ async def get_tvbox_json(request: Request) -> dict:
     return {
         "lives": [
             {
-                "name": "声桥网关全频道(含全套EPG+外语AI字幕)",
+                "name": "声幕 SubCast 全频道(含全套EPG+外语AI字幕)",
                 "type": 0,
                 "url": f"{base_url}/playlist.m3u",
                 "playerType": 2,
@@ -429,7 +429,7 @@ async def get_tvbox_json(request: Request) -> dict:
                 "logo": "https://live.fanmingming.com/tv/{name}.png",
             },
             {
-                "name": "外语实时翻译专区(30个国际/英语台)",
+                "name": "声幕 SubCast 外语同传专区(109路国际台)",
                 "type": 0,
                 "url": f"{base_url}/playlist_foreign.m3u",
                 "playerType": 2,
@@ -687,14 +687,26 @@ async def sync_remote_epg(url_str: str) -> dict:
                     errors.append(f"{u}: {exc}")
 
         if fetched_channels > 0 or fetched_progs > 0:
+            cutoff_date = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y%m%d")
             for cid in sorted(seen_channels.keys()):
                 base_root.append(seen_channels[cid])
             for cid in sorted(progs_by_ch.keys()):
-                for pr_el in progs_by_ch[cid]:
+                st_map = {
+                    (pr_el.get("start") or "").strip(): pr_el
+                    for pr_el in progs_by_ch[cid]
+                    if len((pr_el.get("start") or "").strip()) >= 8
+                }
+                if not st_map:
+                    continue
+                filtered = [pr_el for st, pr_el in sorted(st_map.items()) if st[:8] >= cutoff_date]
+                if not filtered:
+                    max_d = max(st[:8] for st in st_map.keys())
+                    filtered = [pr_el for st, pr_el in sorted(st_map.items()) if st[:8] == max_d]
+                for pr_el in filtered:
                     base_root.append(pr_el)
             xml_bytes = _ET.tostring(base_root, encoding="utf-8", xml_declaration=True)
             epg_file.write_bytes(xml_bytes)
-            with _gzip.open(str(epg_gz), "wb") as gz_out:
+            with _gzip.open(str(epg_gz), "wb", compresslevel=9) as gz_out:
                 gz_out.write(xml_bytes)
             _epg_cache_mtime = 0.0
             _ensure_epg_cache()

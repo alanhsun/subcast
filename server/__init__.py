@@ -1,1 +1,1 @@
-"""LinguaRelay-TV (声桥 TV 版) Server Package."""
+"""声幕 SubCast — Broadcast AI Subtitle Gateway Server Package."""

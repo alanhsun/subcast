@@ -1,8 +1,8 @@
 """
-Download and prepare local offline AI models for LinguaRelay-TV (声桥 TV 版):
+Download and prepare local offline AI models & seed data for 声幕 SubCast (v2.4):
 1. VAD: Silero-VAD (silero_vad.onnx, ~630KB)
-2. ASR (Primary): Alibaba SenseVoice-Small (zh/en/ja/ko/yue multilingual int8, ~228MB)
-3. ASR (Fallback): sherpa-onnx-streaming-zipformer-en-2023-06-26 (int8)
+2. ASR (Primary): Alibaba Qwen3-ASR-0.6B (30 languages + 22 dialects int8, ~600MB)
+3. ASR (Legacy optional via --legacy): SenseVoice-Small / Streaming Zipformer
 4. Punctuation: sherpa-onnx-online-punct-en-2024-08-06 (Edge-Punct-Casing int8)
 5. Translation (Fallback Offline NMT): CTranslate2 en->zh offline model + SentencePiece
 """
@@ -26,7 +26,6 @@ SEED_DATA_DIR = ROOT_DIR / "seed_data"
 VAD_DIR = MODELS_DIR / "vad"
 QWEN3_ASR_DIR = MODELS_DIR / "qwen3_asr"
 SENSEVOICE_DIR = MODELS_DIR / "sensevoice"
-CANARY_DIR = MODELS_DIR / "canary"
 ASR_DIR = MODELS_DIR / "asr"
 PUNCT_DIR = MODELS_DIR / "punct"
 NMT_DIR = MODELS_DIR / "nmt"
@@ -38,6 +37,11 @@ HF_QWEN3_ASR_BASE = (
     "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main"
 )
 
+HF_SENSEVOICE_BASE = (
+    "https://huggingface.co/csukuangfj/"
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main"
+)
+
 QWEN3_ASR_FILES = {
     "conv_frontend.onnx": f"{HF_QWEN3_ASR_BASE}/conv_frontend.onnx",
     "encoder.int8.onnx": f"{HF_QWEN3_ASR_BASE}/encoder.int8.onnx",
@@ -45,28 +49,13 @@ QWEN3_ASR_FILES = {
     "tokenizer/merges.txt": f"{HF_QWEN3_ASR_BASE}/tokenizer/merges.txt",
     "tokenizer/tokenizer_config.json": f"{HF_QWEN3_ASR_BASE}/tokenizer/tokenizer_config.json",
     "tokenizer/vocab.json": f"{HF_QWEN3_ASR_BASE}/tokenizer/vocab.json",
+    "test_en.wav": f"{HF_SENSEVOICE_BASE}/test_wavs/en.wav",
 }
-
-HF_SENSEVOICE_BASE = (
-    "https://huggingface.co/csukuangfj/"
-    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main"
-)
 
 SENSEVOICE_FILES = {
     "model.int8.onnx": f"{HF_SENSEVOICE_BASE}/model.int8.onnx",
     "tokens.txt": f"{HF_SENSEVOICE_BASE}/tokens.txt",
     "test_en.wav": f"{HF_SENSEVOICE_BASE}/test_wavs/en.wav",
-}
-
-HF_CANARY_BASE = (
-    "https://huggingface.co/csukuangfj/"
-    "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8/resolve/main"
-)
-
-CANARY_FILES = {
-    "encoder.int8.onnx": f"{HF_CANARY_BASE}/encoder.int8.onnx",
-    "decoder.int8.onnx": f"{HF_CANARY_BASE}/decoder.int8.onnx",
-    "tokens.txt": f"{HF_CANARY_BASE}/tokens.txt",
 }
 
 HF_ASR_BASE = (
@@ -206,16 +195,6 @@ def ensure_sensevoice_models() -> None:
         download_file(url, target, desc=f"SenseVoice/{filename}")
 
 
-def ensure_canary_models() -> None:
-    CANARY_DIR.mkdir(parents=True, exist_ok=True)
-    for filename, url in CANARY_FILES.items():
-        target = CANARY_DIR / filename
-        if target.exists() and target.stat().st_size > 100:
-            print(f"[OK] Canary-180M-Flash (en/fr/de/es) file ready: {target.name}")
-            continue
-        download_file(url, target, desc=f"Canary-180M-Flash/{filename}")
-
-
 def ensure_asr_models() -> None:
     ASR_DIR.mkdir(parents=True, exist_ok=True)
     for filename, url in ASR_FILES.items():
@@ -291,7 +270,7 @@ def ensure_nmt_models() -> None:
 
 
 def main() -> int:
-    print("=== LinguaRelay-TV v2.4 Offline Model & Seed Data Initializer ===")
+    print("=== 声幕 SubCast v2.4 Offline Model & Seed Data Initializer ===")
     ensure_seed_data()
     ensure_vad_model()
     ensure_qwen3_asr_models()
