@@ -664,7 +664,10 @@ async def sync_remote_epg(url_str: str) -> dict:
                     raw_bytes = resp.content
                     if raw_bytes[:2] == b"\x1f\x8b" or u.lower().split("?")[0].endswith(".gz"):
                         raw_bytes = _gzip.decompress(raw_bytes)
-                    remote_root = _ET.fromstring(raw_bytes.decode("utf-8", errors="ignore"))
+                    xml_str = raw_bytes.decode("utf-8", errors="ignore")
+                    if "epg.pw" in u.lower() and any(tag in u.upper() for tag in ("_CN", "_HK", "_TW", "_SG")):
+                        xml_str = xml_str.replace(" +0000", " +0800")
+                    remote_root = _ET.fromstring(xml_str)
                     remote_ch_ids: set[str] = set()
                     for ch_el in remote_root.findall("channel"):
                         cid = (ch_el.get("id") or "").strip()
@@ -1706,15 +1709,21 @@ WEB_CONSOLE_HTML = """<!DOCTYPE html>
       </div>
       <textarea id="playlistEditor" style="height:260px;" placeholder="频道名,http://... 或 #EXTINF..."></textarea>
 
-      <div style="border-top:1px solid var(--line); padding-top:14px; display:grid; gap:8px;">
+      <div style="border-top:1px solid var(--line); padding-top:14px; display:grid; gap:10px;">
         <div class="section-head--split">
           <div style="font-size:13px; font-weight:500;">
-            在线 EPG 源地址 <span class="muted">支持 .xml / .xml.gz，多个地址用逗号分隔</span>
+            在线 EPG 源地址 <span class="muted">点选内置知名源或输入自定义 .xml / .xml.gz</span>
           </div>
           <span id="epgStatusBadge" class="mono muted" style="font-size:12px;">...</span>
         </div>
+        <div class="tabs" role="tablist" aria-label="知名 EPG 源预设" id="epgPresetSeg" style="justify-self:start; flex-wrap:wrap;">
+          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml" aria-selected="true" onclick="applyEpgPreset(this.dataset.epg)">聚合双源 · 推荐</button>
+          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">112114 极速源</button>
+          <button type="button" class="tab" role="tab" data-epg="https://live.fanmingming.com/e.xml" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">范明明 Fanmingming</button>
+          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz,https://epg.pw/xmltv/epg_HK.xml.gz,https://epg.pw/xmltv/epg_TW.xml.gz,https://epg.pw/xmltv/epg_GB.xml.gz" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">epg.pw 港澳台+国际</button>
+        </div>
         <div style="display:flex; gap:8px;">
-          <input type="text" id="epgSourceInput" class="mono" style="flex:1; height:var(--btn-h-sm); padding:0 10px; border:1px solid var(--line-strong); border-radius:var(--r-sm); background:var(--bg); font-size:12.5px;" placeholder="https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml">
+          <input type="text" id="epgSourceInput" class="mono" style="flex:1; height:var(--btn-h-sm); padding:0 10px; border:1px solid var(--line-strong); border-radius:var(--r-sm); background:var(--bg); font-size:12.5px;" placeholder="https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml" oninput="syncEpgPresetHighlight()">
           <button type="button" class="btn btn--secondary btn--sm" id="btnSyncEpg" onclick="saveAndSyncEpg()">保存并同步 EPG</button>
         </div>
       </div>
@@ -1805,6 +1814,20 @@ function applyPreset(baseUrl, model) {
   document.getElementById('llmBaseUrl').value = baseUrl;
   document.getElementById('llmModel').value = model;
   syncPresetHighlight();
+}
+
+function syncEpgPresetHighlight() {
+  const inp = document.getElementById('epgSourceInput');
+  if (!inp) return;
+  const val = inp.value.trim();
+  document.querySelectorAll('#epgPresetSeg .tab').forEach(btn => {
+    btn.setAttribute('aria-selected', btn.dataset.epg === val ? 'true' : 'false');
+  });
+}
+
+function applyEpgPreset(url) {
+  document.getElementById('epgSourceInput').value = url;
+  syncEpgPresetHighlight();
 }
 
 function updateSegActive(containerId, val) {
@@ -1922,6 +1945,7 @@ async function loadStatus() {
     }
     if (data.epg_source_url) {
       document.getElementById('epgSourceInput').value = data.epg_source_url;
+      syncEpgPresetHighlight();
     }
     syncPresetHighlight();
     llmFormInitialized = true;
