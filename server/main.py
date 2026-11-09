@@ -881,7 +881,7 @@ async def api_send_test_subtitle(payload: TestSubtitlePayload) -> dict:
     return {"ok": True, "subtitle": msg}
 
 
-WEB_CONSOLE_HTML = """<!DOCTYPE html>
+WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN" data-radius="soft" data-buttons="solid">
 <head>
 <meta charset="UTF-8">
