@@ -1290,12 +1290,46 @@ WEB_CONSOLE_HTML = """<!DOCTYPE html>
   @media (prefers-reduced-motion: reduce) {
     .vu-meter.is-live i { animation: none; height: 9px; }
   }
-  .ch-logo {
-    width: 22px;
-    height: 16px;
-    object-fit: contain;
+  .ch-monogram {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    height: 21px;
+    padding: 0 5px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    background: var(--surface);
+    color: var(--muted);
+    border: 1px solid var(--line);
     flex-shrink: 0;
-    border-radius: 2px;
+    user-select: none;
+  }
+  .ch-monogram--foreign {
+    background: color-mix(in oklab, var(--accent) 11%, transparent);
+    color: var(--accent);
+    border-color: color-mix(in oklab, var(--accent) 30%, transparent);
+  }
+  .src-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    padding: 0 7px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    color: var(--muted);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .src-badge.is-live {
+    color: var(--accent);
+    background: color-mix(in oklab, var(--accent) 12%, transparent);
+    font-weight: 500;
   }
   .monitor-metrics {
     display: flex;
@@ -1875,6 +1909,38 @@ async function saveAndTestLlm() {
   loadStatus();
 }
 
+function getChannelCallsign(name, group) {
+  const n = (name || '').trim();
+  const up = n.toUpperCase();
+  const mCctv = up.match(/^CCTV-?(\d+\+?|[48]K)/);
+  if (mCctv) {
+    const num = mCctv[1];
+    return num.length <= 2 ? `CC${num}` : `C${num}`;
+  }
+  if (up.startsWith('CCTV')) return n.replace(/^CCTV/i, '').slice(0, 2) || 'CCTV';
+  if (up.startsWith('CGTN')) return 'CGTN';
+  const known = [
+    ['BBC', 'BBC'], ['CNN', 'CNN'], ['SKY NEWS', 'SKY'], ['REUTERS', 'RTR'],
+    ['BLOOMBERG', 'BBG'], ['CNBC', 'CNBC'], ['FOX', 'FOX'], ['NBC', 'NBC'],
+    ['CBS', 'CBS'], ['FRANCE 24', 'F24'], ['FRANCEINFO', 'FIN'], ['LCI', 'LCI'],
+    ['EURONEWS', 'EUR'], ['DW', 'DW'], ['TAGESSCHAU', 'ARD'], ['RTVE', '24H'],
+    ['NHK', 'NHK'], ['NEWS24', 'N24'], ['WEATHERNEWS', 'WNI'], ['ARIRANG', 'ARI'],
+    ['KBS', 'KBS'], ['TBS', 'TBS'], ['CNA', 'CNA'], ['AL JAZEERA', 'AJE'],
+    ['TRT', 'TRT'], ['I24', 'I24'], ['WION', 'WION'], ['INDIA TODAY', 'IND'],
+    ['NDTV', 'NDTV'], ['RT ', 'RT'], ['RUSSIA', 'R24'], ['VOA', 'VOA'],
+    ['NEWSMAX', 'MAX'], ['USA TODAY', 'USA'], ['CHEDDAR', 'CHD'], ['YAHOO', 'YHO'],
+    ['ABC NEWS', 'ABC'], ['AUSBIZ', 'BIZ'], ['GLOBAL NEWS', 'GLB'], ['GB NEWS', 'GBN'],
+    ['TALKTV', 'TLK'], ['LOVE NATURE', '4K'], ['HISTORY', 'HIS'], ['RED BULL', 'RBT'],
+    ['GUSTO', 'GUS'], ['TRAVELXP', 'TXP'], ['SUPREME', 'SMT'], ['TVBS', 'TVBS'],
+    ['TVB', 'TVB'], ['CHC', 'CHC']
+  ];
+  for (const [kw, code] of known) {
+    if (up.includes(kw)) return code;
+  }
+  const cleanZh = n.replace(/^[A-Za-z0-9\s\-+]+/, '').trim() || n;
+  return cleanZh.slice(0, 2).toUpperCase();
+}
+
 function renderChannelList() {
   const listEl = document.getElementById('channelList');
   const q = (document.getElementById('chSearchInput').value || '').trim().toLowerCase();
@@ -1882,20 +1948,68 @@ function renderChannelList() {
   const filtered = allChannels.filter(ch =>
     !q || ch.name.toLowerCase().includes(q) || (ch.group || '').toLowerCase().includes(q)
   );
-  document.getElementById('chCountBadge').textContent = `${filtered.length} 个频道`;
+
+  // Merge multiple backup streams of the same channel into a single row
+  const groupedMap = new Map();
   filtered.forEach(ch => {
+    const baseName = ch.name.replace(/\s*[\(（]源\d+[\)）]$/, '').trim();
+    if (!groupedMap.has(baseName)) {
+      groupedMap.set(baseName, {
+        name: baseName,
+        group: ch.group || '',
+        need_translate: !!ch.need_translate,
+        sources: []
+      });
+    }
+    groupedMap.get(baseName).sources.push(ch);
+  });
+
+  const mergedList = Array.from(groupedMap.values());
+  document.getElementById('chCountBadge').textContent = `${mergedList.length} 频道 · ${filtered.length} 源`;
+
+  mergedList.forEach(item => {
     const li = document.createElement('li');
-    const isCurrent = isSidecarActive && activeUpstreamUrl === ch.url;
+    const activeIdx = isSidecarActive ? item.sources.findIndex(s => s.url === activeUpstreamUrl) : -1;
+    const isCurrent = activeIdx !== -1;
     const dot = isCurrent ? '<span class="status-dot is-live"></span>' : '';
-    const logo = ch.logo ? `<img class="ch-logo" src="${ch.logo}" alt="" loading="lazy" onerror="this.style.display='none'">` : '';
-    const grp = ch.group ? `<span class="muted" style="font-size:12.5px; font-weight:400;">${ch.group}</span>` : '';
-    li.innerHTML = `<div class="rows__name">${dot}${logo}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${ch.name}</span>${grp}</div>`;
+    const callsign = getChannelCallsign(item.name, item.group);
+    const monoCls = item.need_translate ? 'ch-monogram ch-monogram--foreign' : 'ch-monogram';
+    const monoTitle = item.need_translate ? '外语频道 · 自动启用 AI 同传字幕' : '中文频道 · 原画直连免译';
+    const monoBadge = `<span class="${monoCls}" title="${monoTitle}">${callsign}</span>`;
+    const grp = item.group ? `<span class="muted" style="font-size:12.5px; font-weight:400; flex-shrink:0;">${item.group}</span>` : '';
+
+    li.innerHTML = `<div class="rows__name">${dot}${monoBadge}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${item.name}</span>${grp}</div>`;
+
+    const rightBox = document.createElement('div');
+    rightBox.style.cssText = 'display:inline-flex; align-items:center; gap:6px;';
+
+    const srcSpan = document.createElement('span');
+    srcSpan.className = isCurrent ? 'src-badge is-live' : 'src-badge';
+    srcSpan.textContent = isCurrent && item.sources.length > 1
+      ? `源 ${activeIdx + 1}/${item.sources.length}`
+      : `${item.sources.length} 源`;
+    rightBox.appendChild(srcSpan);
+
+    if (isCurrent && item.sources.length > 1) {
+      const switchBtn = document.createElement('button');
+      switchBtn.type = 'button';
+      switchBtn.className = 'btn btn--secondary btn--sm';
+      switchBtn.textContent = '换源';
+      switchBtn.title = '切换至该频道的下一个备用直播源';
+      const nextSrc = item.sources[(activeIdx + 1) % item.sources.length];
+      switchBtn.onclick = () => pinChannel(nextSrc.id, item.name, nextSrc.url);
+      rightBox.appendChild(switchBtn);
+    }
+
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = isCurrent ? 'btn btn--primary btn--sm' : 'btn btn--secondary btn--sm';
     btn.textContent = isCurrent ? '监听中' : '监听';
-    btn.onclick = () => pinChannel(ch.id, ch.name, ch.url);
-    li.appendChild(btn);
+    const targetSrc = isCurrent ? item.sources[activeIdx] : item.sources[0];
+    btn.onclick = () => pinChannel(targetSrc.id, item.name, targetSrc.url);
+    rightBox.appendChild(btn);
+
+    li.appendChild(rightBox);
     listEl.appendChild(li);
   });
 }
