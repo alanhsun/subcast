@@ -228,7 +228,7 @@ public class SubtitleOverlayService extends Service {
         }
 
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String hostPort = prefs.getString(KEY_SERVER_HOST, "192.168.31.23:8765");
+        String hostPort = prefs.getString(KEY_SERVER_HOST, "10.10.10.80:8765");
         String wsUrl = "ws://" + hostPort.trim() + "/ws/subtitles";
         currentStatusText = "正在连接 " + hostPort + " ...";
 

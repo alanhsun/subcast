@@ -1623,7 +1623,7 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
 
     <div class="nav__actions">
       <button type="button" class="btn btn--secondary btn--sm" onclick="toggleTheme()" id="themeBtn">夜间外观</button>
-      <a class="btn btn--primary btn--sm" href="/download/lingua-relay-tv.apk">
+      <a class="btn btn--primary btn--sm" href="/download/subcast-tv.apk">
         下载电视端 APK
         <svg class="m-arrow" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 6h8"/><path d="M4.5 2.5 8 6l-3.5 3.5"/></svg>
       </a>
@@ -2297,13 +2297,16 @@ async def get_logo_png() -> FileResponse:
     return FileResponse(str(logo_png), media_type="image/png")
 
 
+@app.get("/download/subcast-tv.apk")
 @app.get("/download/lingua-relay-tv.apk")
 async def download_apk() -> FileResponse:
-    apk_path = ROOT_DIR / "dist" / "lingua-relay-tv.apk"
+    apk_path = ROOT_DIR / "dist" / "subcast-tv.apk"
+    if not apk_path.exists():
+        apk_path = ROOT_DIR / "dist" / "lingua-relay-tv.apk"
     if not apk_path.exists():
         raise HTTPException(status_code=404, detail="APK not built yet")
     return FileResponse(
         path=str(apk_path),
         media_type="application/vnd.android.package-archive",
-        filename="lingua-relay-tv.apk",
+        filename="subcast-tv.apk",
     )

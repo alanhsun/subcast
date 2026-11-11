@@ -178,6 +178,10 @@ def test_epg_and_foreign_playlist_routes() -> None:
         assert r_logo_png.status_code == 200
         assert len(r_logo_png.content) > 1000
 
+        r_apk = client.get("/download/subcast-tv.apk")
+        assert r_apk.status_code == 200
+        assert len(r_apk.content) > 10000
+
         r_foreign = client.get("/playlist_foreign.m3u")
         assert r_foreign.status_code == 200
         assert "CGTN" in r_foreign.text

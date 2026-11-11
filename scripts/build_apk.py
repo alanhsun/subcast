@@ -2,7 +2,7 @@
 Self-contained Android TV APK compiler for 声幕 SubCast (v2.4).
 Automatically provisions portable OpenJDK 17, Android build-tools (aapt2, d8, zipalign, apksigner),
 Android platform android.jar, and platform-tools (adb.exe) into `.toolchain/`, then builds and signs
-`dist/lingua-relay-tv.apk`.
+`dist/subcast-tv.apk`.
 """
 
 from __future__ import annotations
@@ -67,7 +67,14 @@ def download_and_extract(url: str, extract_to: Path, marker_glob: str, label: st
 
 def run_cmd(cmd: list[str], env: dict[str, str] | None = None) -> None:
     print("[Run]", " ".join(str(c) for c in cmd))
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    res = subprocess.run(
+        cmd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if res.returncode != 0:
         print("STDOUT:", res.stdout)
         print("STDERR:", res.stderr)
@@ -113,7 +120,7 @@ def build_apk() -> Path:
     manifest_path = ANDROID_PROJECT_DIR / "AndroidManifest.xml"
     unaligned_apk = BUILD_TMP / "unaligned.apk"
     aligned_apk = BUILD_TMP / "aligned.apk"
-    final_apk = DIST_DIR / "lingua-relay-tv.apk"
+    final_apk = DIST_DIR / "subcast-tv.apk"
 
     # 1. Link manifest with aapt2 to create base APK container and R.java (if any)
     r_java_dir = BUILD_TMP / "gen"

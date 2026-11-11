@@ -148,7 +148,7 @@ docker compose up -d
 | **TXT 纯文本订阅** | `http://10.10.10.80:8765/playlist.txt` | 不支持 | 需单独填 EPG | 旧版纯文本壳子兼容 |
 
 ### 电视端悬浮字幕 APK 安装
-1. 在浏览器打开控制台 `http://10.10.10.80:8765`，点击右上角 **下载电视端 APK**（或访问 `http://10.10.10.80:8765/download/lingua-relay-tv.apk`）。
+1. 在浏览器打开控制台 `http://10.10.10.80:8765`，点击右上角 **下载电视端 APK**（或访问 `http://10.10.10.80:8765/download/subcast-tv.apk`）。
 2. 安装至 Android TV 并授予“显示在其他应用上层”权限。应用启动后会自动通过局域网 UDP 发现网关并常驻后台。
 
 ---
@@ -191,7 +191,7 @@ python -m uvicorn server.main:app --host 0.0.0.0 --port 8765
 │   ├── playlist_source.txt     # 内置 337 路精选直播源 (212 独立频道，含台标属性)
 │   └── epg.xml.gz              # 内置全频道压缩 XMLTV 电子节目单种子库
 ├── dist/
-│   └── lingua-relay-tv.apk     # Android TV 零配置透明悬浮字幕客户端 (24.4 KB)
+│   └── subcast-tv.apk          # Android TV 零配置透明悬浮字幕客户端 (24.4 KB)
 ├── Dockerfile                  # 生产级容器构建文件
 ├── docker-compose.yml          # Unraid / Docker Compose 编排文件
 ├── unraid-template.xml         # Unraid DockerMan 原生图形模板

@@ -107,7 +107,7 @@ public class MainActivity extends Activity {
         hostRow.addView(lblHost);
 
         etServerHost = new EditText(this);
-        etServerHost.setText(prefs.getString(SubtitleOverlayService.KEY_SERVER_HOST, "192.168.31.23:8765"));
+        etServerHost.setText(prefs.getString(SubtitleOverlayService.KEY_SERVER_HOST, "10.10.10.80:8765"));
         etServerHost.setTextColor(Color.parseColor("#F4F4F5"));
         etServerHost.setBackgroundColor(Color.parseColor("#121215"));
         etServerHost.setPadding(dp(12), dp(8), dp(12), dp(8));
@@ -239,7 +239,7 @@ public class MainActivity extends Activity {
 
     private void updateStatusUi() {
         SharedPreferences prefs = getSharedPreferences(SubtitleOverlayService.PREFS_NAME, MODE_PRIVATE);
-        String host = prefs.getString(SubtitleOverlayService.KEY_SERVER_HOST, "192.168.31.23:8765");
+        String host = prefs.getString(SubtitleOverlayService.KEY_SERVER_HOST, "10.10.10.80:8765");
         if (!etServerHost.hasFocus() && !host.equals(etServerHost.getText().toString())) {
             etServerHost.setText(host);
         }
@@ -296,7 +296,7 @@ public class MainActivity extends Activity {
 
     private void triggerTestSubtitle() {
         SharedPreferences prefs = getSharedPreferences(SubtitleOverlayService.PREFS_NAME, MODE_PRIVATE);
-        final String host = prefs.getString(SubtitleOverlayService.KEY_SERVER_HOST, "192.168.31.23:8765");
+        final String host = prefs.getString(SubtitleOverlayService.KEY_SERVER_HOST, "10.10.10.80:8765");
         Thread t = new Thread(() -> {
             try {
                 URL url = new URL("http://" + host + "/api/test-subtitle");
