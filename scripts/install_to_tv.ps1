@@ -17,16 +17,24 @@ if (-not (Test-Path $ApkPath)) {
     python (Join-Path $RootDir "scripts\build_apk.py")
 }
 
-Write-Host "[2/4] Connecting to TV ($TvIp:5555)..." -ForegroundColor Cyan
+Write-Host "[2/4] Connecting to TV (${TvIp}:5555)..." -ForegroundColor Cyan
 & $Adb connect "$TvIp`:5555"
 
 Write-Host "[3/4] Installing subcast-tv.apk to $TvIp..." -ForegroundColor Cyan
 & $Adb -s "$TvIp`:5555" push "$ApkPath" /sdcard/Download/subcast-tv.apk
-& $Adb -s "$TvIp`:5555" install -r "$ApkPath"
+try {
+    & $Adb -s "$TvIp`:5555" shell "cp /sdcard/Download/subcast-tv.apk /data/local/tmp/subcast-tv.apk && chmod 644 /data/local/tmp/subcast-tv.apk"
+    & $Adb -s "$TvIp`:5555" shell pm disable-user --user 0 com.android.packageinstaller
+    & $Adb -s "$TvIp`:5555" shell pm install -r -d /data/local/tmp/subcast-tv.apk
+} finally {
+    & $Adb -s "$TvIp`:5555" shell pm enable com.android.packageinstaller
+    & $Adb -s "$TvIp`:5555" shell rm -f /data/local/tmp/subcast-tv.apk
+}
 
 Write-Host "[4/4] Granting SYSTEM_ALERT_WINDOW & APP_AUTO_START permissions..." -ForegroundColor Cyan
 & $Adb -s "$TvIp`:5555" shell appops set com.shengqiao.tv SYSTEM_ALERT_WINDOW allow
-& $Adb -s "$TvIp`:5555" shell cmd appops set com.shengqiao.tv APP_AUTO_START allow
+& $Adb -s "$TvIp`:5555" shell appops set com.shengqiao.tv APP_AUTO_START allow
+& $Adb -s "$TvIp`:5555" shell am force-stop com.shengqiao.tv
 & $Adb -s "$TvIp`:5555" shell am start -n com.shengqiao.tv/.MainActivity
 
 Write-Host "=== Done! 声幕 SubCast is running on $TvIp ===" -ForegroundColor Green
