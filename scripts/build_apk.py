@@ -118,11 +118,29 @@ def build_apk() -> Path:
     env["PATH"] = f"{jdk_bin};{build_tools_dir};{adb_exe.parent};{env.get('PATH', '')}"
 
     manifest_path = ANDROID_PROJECT_DIR / "AndroidManifest.xml"
+    res_dir = ANDROID_PROJECT_DIR / "res"
+    compiled_res_zip = BUILD_TMP / "compiled_res.zip"
     unaligned_apk = BUILD_TMP / "unaligned.apk"
     aligned_apk = BUILD_TMP / "aligned.apk"
     final_apk = DIST_DIR / "subcast-tv.apk"
 
-    # 1. Link manifest with aapt2 to create base APK container and R.java (if any)
+    # 1a. Compile res/ directory (icons, adaptive vectors, TV banner) with aapt2 if present
+    link_extra_args: list[str] = []
+    if res_dir.exists():
+        run_cmd(
+            [
+                str(aapt2_exe),
+                "compile",
+                "--dir",
+                str(res_dir),
+                "-o",
+                str(compiled_res_zip),
+            ],
+            env=env,
+        )
+        link_extra_args = ["-R", str(compiled_res_zip), "--auto-add-overlay"]
+
+    # 1b. Link manifest & compiled resources with aapt2 to create base APK container and R.java
     r_java_dir = BUILD_TMP / "gen"
     r_java_dir.mkdir(parents=True, exist_ok=True)
     run_cmd(
@@ -137,6 +155,7 @@ def build_apk() -> Path:
             str(manifest_path),
             "--java",
             str(r_java_dir),
+            *link_extra_args,
         ],
         env=env,
     )

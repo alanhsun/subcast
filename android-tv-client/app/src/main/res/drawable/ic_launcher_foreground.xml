@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <group
+        android:pivotX="256"
+        android:pivotY="256"
+        android:scaleX="0.68"
+        android:scaleY="0.68">
+        <!-- Broadcast Horizon Line -->
+        <path
+            android:strokeColor="#2E3138"
+            android:strokeWidth="4"
+            android:strokeLineCap="round"
+            android:pathData="M88,316L424,316" />
+        <!-- Bar 1 -->
+        <path
+            android:fillColor="#EEEEB0"
+            android:fillAlpha="0.78"
+            android:pathData="M130,172L130,172A18,18 0,0 1,148 190L148,250A18,18 0,0 1,130 268L130,268A18,18 0,0 1,112 250L112,190A18,18 0,0 1,130 172z" />
+        <!-- Bar 2 -->
+        <path
+            android:fillColor="#EEEEEC"
+            android:pathData="M193,116L193,116A18,18 0,0 1,211 134L211,250A18,18 0,0 1,193 268L193,268A18,18 0,0 1,175 250L175,134A18,18 0,0 1,193 116z" />
+        <!-- Bar 3 (Signal Orange Peak) -->
+        <path
+            android:fillColor="#FF4A1F"
+            android:pathData="M256,84L256,84A18,18 0,0 1,274 102L274,250A18,18 0,0 1,256 268L256,268A18,18 0,0 1,238 250L238,102A18,18 0,0 1,256 84z" />
+        <!-- Bar 4 -->
+        <path
+            android:fillColor="#EEEEEC"
+            android:pathData="M319,132L319,132A18,18 0,0 1,337 150L337,250A18,18 0,0 1,319 268L319,268A18,18 0,0 1,301 250L301,150A18,18 0,0 1,319 132z" />
+        <!-- Bar 5 -->
+        <path
+            android:fillColor="#EEEEB0"
+            android:fillAlpha="0.78"
+            android:pathData="M382,184L382,184A18,18 0,0 1,400 202L400,250A18,18 0,0 1,382 268L382,268A18,18 0,0 1,364 250L364,202A18,18 0,0 1,382 184z" />
+        <!-- Primary Translated Subtitle Track -->
+        <path
+            android:fillColor="#FF4A1F"
+            android:pathData="M121,352L391,352A17,17 0,0 1,408 369L408,369A17,17 0,0 1,391 386L121,386A17,17 0,0 1,104 369L104,369A17,17 0,0 1,121 352z" />
+        <!-- Secondary Original Subtitle Track -->
+        <path
+            android:fillColor="#94979C"
+            android:pathData="M159,404L301,404A11,11 0,0 1,312 415L312,415A11,11 0,0 1,301 426L159,426A11,11 0,0 1,148 415L148,415A11,11 0,0 1,159 404z" />
+        <!-- Live Sync Dot -->
+        <path
+            android:fillColor="#FF4A1F"
+            android:pathData="M348,415m-11,0a11,11 0,1 1,22 0a11,11 0,1 1,-22 0" />
+    </group>
+</vector>

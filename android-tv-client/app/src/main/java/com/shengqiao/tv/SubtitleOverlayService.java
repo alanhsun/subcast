@@ -136,14 +136,14 @@ public class SubtitleOverlayService extends Service {
             Notification notif = new Notification.Builder(this, channelId)
                     .setContentTitle("声幕 SubCast 实时字幕运行中")
                     .setContentText("正在监听直播流双语字幕")
-                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                    .setSmallIcon(R.mipmap.ic_launcher)
                     .build();
             startForeground(1001, notif);
         } else {
             Notification notif = new Notification.Builder(this)
                     .setContentTitle("声幕 SubCast 实时字幕运行中")
                     .setContentText("正在监听直播流双语字幕")
-                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                    .setSmallIcon(R.mipmap.ic_launcher)
                     .build();
             startForeground(1001, notif);
         }

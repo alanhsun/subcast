@@ -17,6 +17,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -75,13 +76,43 @@ public class MainActivity extends Activity {
         int pad = dp(36);
         root.setPadding(pad, dp(28), pad, dp(28));
 
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        headerRow.setPadding(0, 0, 0, dp(14));
+
+        ImageView logoView = new ImageView(this);
+        logoView.setImageResource(R.drawable.ic_logo);
+        LinearLayout.LayoutParams logoLp = new LinearLayout.LayoutParams(dp(40), dp(40));
+        logoLp.rightMargin = dp(12);
+        headerRow.addView(logoView, logoLp);
+
         TextView title = new TextView(this);
         title.setText("声幕 SubCast");
         title.setTextColor(Color.parseColor("#F4F4F5"));
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setPadding(0, 0, 0, dp(14));
-        root.addView(title);
+        headerRow.addView(title);
+
+        TextView badge = new TextView(this);
+        badge.setText("v2.4");
+        badge.setTextColor(Color.parseColor("#FF4A1F"));
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        badge.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        badge.setPadding(dp(8), dp(2), dp(8), dp(2));
+        GradientDrawable badgeBg = new GradientDrawable();
+        badgeBg.setColor(Color.parseColor("#2A1612"));
+        badgeBg.setStroke(dp(1), Color.parseColor("#FF4A1F"));
+        badgeBg.setCornerRadius(dp(6));
+        badge.setBackground(badgeBg);
+        LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        badgeLp.leftMargin = dp(10);
+        headerRow.addView(badge, badgeLp);
+
+        root.addView(headerRow);
 
         tvStatus = new TextView(this);
         tvStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
