@@ -123,6 +123,8 @@ def test_foreign_vs_chinese_channel_classification_and_epg() -> None:
 http://1.2.3.4/cctv1.m3u8
 #EXTINF:-1 tvg-id="CGTN" tvg-name="CGTN" group-title="央视频道",CGTN
 http://1.2.3.4/cgtn.m3u8
+#EXTINF:-1 tvg-id="凤凰中文" tvg-name="凤凰中文" group-title="香港/澳门",凤凰中文
+http://1.2.3.4/fhzw.m3u8
 #EXTINF:-1 tvg-id="翡翠台" tvg-name="翡翠台" group-title="香港/澳门",翡翠台
 http://1.2.3.4/jade.m3u8
 #EXTINF:-1 tvg-id="Sky News天空新闻" tvg-name="Sky News" group-title="国际/海外",Sky News天空新闻
@@ -133,7 +135,8 @@ http://1.2.3.4/lovenature.m3u8
     channels = parse_playlist(sample_m3u)
     by_name = {c.name: c for c in channels}
     assert by_name["CCTV1"].need_translate is False
-    assert by_name["翡翠台"].need_translate is False
+    assert by_name["凤凰中文"].need_translate is False
+    assert by_name["翡翠台"].need_translate is True
     assert by_name["CGTN"].need_translate is True
     assert by_name["Sky News天空新闻"].need_translate is True
     assert by_name["Love Nature 4K"].need_translate is True
@@ -147,7 +150,8 @@ http://1.2.3.4/lovenature.m3u8
 
     m3u_foreign = export_m3u(channels, "http://10.10.10.80:8765", only_foreign=True)
     assert "CCTV1" not in m3u_foreign
-    assert "翡翠台" not in m3u_foreign
+    assert "凤凰中文" not in m3u_foreign
+    assert "翡翠台" in m3u_foreign
     assert "CGTN" in m3u_foreign
     assert "Sky News天空新闻" in m3u_foreign
 

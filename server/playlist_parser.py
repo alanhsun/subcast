@@ -16,12 +16,11 @@ from dataclasses import dataclass
 from typing import List
 from urllib.parse import quote
 
-# Domestic/Chinese groups where channels are already in Chinese (unless channel name matches foreign keywords)
+# Domestic/Chinese groups where channels are already in Mandarin Chinese (unless channel name matches foreign/Cantonese keywords)
 _CHINESE_GROUPS = {
     "央视频道",
     "卫视频道",
     "地方频道",
-    "香港/澳门",
     "台湾",
     "电影频道",
     "纪录频道",
@@ -30,6 +29,13 @@ _CHINESE_GROUPS = {
     "音乐频道",
     "解说频道",
 }
+
+_HK_MANDARIN_KEYWORDS = (
+    "凤凰中文",
+    "凤凰资讯",
+    "莲花卫视",
+    "澳亚卫视",
+)
 
 _FOREIGN_NAME_KEYWORDS = (
     "cgtn",
@@ -71,20 +77,36 @@ _FOREIGN_NAME_KEYWORDS = (
     "nhk world",
     "arirang",
     "kbs world",
+    "翡翠台",
+    "无线新闻",
+    "有线新闻",
+    "凤凰香港",
+    "美亚电影",
+    "亚洲剧台",
+    "香港面包",
+    "环球电视",
+    "viutv",
+    "rthk",
+    "hbo",
+    "cinemax",
+    "axn",
 )
 
 
 def is_foreign_channel(name: str, group: str) -> bool:
     """
-    Determine whether a channel should trigger the real-time English->Chinese AI subtitle pipeline.
+    Determine whether a channel should trigger the real-time AI subtitle pipeline.
     - All channels in '国际/海外' or non-domestic groups default to True.
-    - Any channel whose name matches foreign/English broadcast keywords (e.g., CGTN, Love Nature 4K,
-      History, BBC, Sky News, DW, CNA) returns True even if placed in '央视频道' or '4K超高清'.
+    - Cantonese/English channels in '香港/澳门' (e.g., 无线新闻台, 有线新闻台, 翡翠台, 凤凰香港) return True,
+      while Mandarin channels (凤凰中文, 凤凰资讯) return False.
+    - Any channel whose name matches foreign/English/Cantonese broadcast keywords returns True.
     """
     low_name = (name or "").lower()
     grp = (group or "").strip()
     if any(kw in low_name for kw in _FOREIGN_NAME_KEYWORDS):
         return True
+    if grp == "香港/澳门":
+        return not any(mk in low_name for mk in _HK_MANDARIN_KEYWORDS)
     if grp in ("国际/海外", "国际直播", "欧美英语直播", "国际频道", "海外频道"):
         return True
     if grp in _CHINESE_GROUPS:
@@ -298,8 +320,15 @@ def export_txt(
     out: List[str] = []
     for group_name, items in grouped.items():
         out.append(f"{group_name},#genre#")
+        merged_by_name: dict[str, List[str]] = {}
         for ch in items:
-            target_url = ch.url if (direct_chinese and not ch.need_translate) else build_proxy_url(base_url, ch)
-            out.append(f"{ch.name},{target_url}")
+            target_url = (
+                ch.url if (direct_chinese and not ch.need_translate) else build_proxy_url(base_url, ch)
+            )
+            urls = merged_by_name.setdefault(ch.name, [])
+            if target_url not in urls:
+                urls.append(target_url)
+        for ch_name, urls in merged_by_name.items():
+            out.append(f"{ch_name},{'#'.join(urls)}")
         out.append("")
     return "\n".join(out).strip() + "\n"

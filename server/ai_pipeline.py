@@ -106,9 +106,9 @@ class LLMContextTranslator:
 
     SYSTEM_PROMPT = (
         "你是一位顶级的国际电视直播同声传译员。\n"
-        "任务：将用户提供的【当前待译原句】进行整句理解与语序重组，翻译为自然、地道、逻辑连贯的简体中文电视字幕。\n"
+        "任务：将用户提供的【当前待译原句】（可能为英语、日语、韩语、法语、德语、西班牙语、俄语、阿拉伯语或粤语等）进行整句理解与语序重组，翻译为自然、地道、逻辑连贯的简体中文电视字幕。\n"
         "核心要求：\n"
-        "1. 整句意译与语序重组：【当前待译原句】包含完整的一句或多句连续直播语音。请先通读整段话，按照中文母语的叙事逻辑重新组织语序（如将英文后置定语、状语从句自然前置或顺译），将零散分句融合为通顺完整的中文整句，切忌按英文语序逐词死板切割。\n"
+        "1. 整句意译与语序重组：【当前待译原句】包含完整的一句或多句连续直播语音。请先通读整段话，按照中文母语的叙事逻辑重新组织语序（如将外语后置定语、状语从句自然前置或顺译，将粤语口语转换为书面标准简体中文），将零散分句融合为通顺完整的中文整句，切忌逐词死板切割。\n"
         "2. 智能纠错与术语还原：结合【频道】与【前文语境】，自动判断并修正前端语音识别（ASR）可能产生的同音错词、断句粘连、人名、地名、机构名或财经/体育/新闻专业术语。\n"
         "3. 严格只输出【当前待译原句】对应的简体中文译文，绝不输出任何解释、前缀、引号或多余内容。"
     )
@@ -150,14 +150,25 @@ class LLMContextTranslator:
     def is_llm_ready(self) -> bool:
         return bool(self.config.enabled and self.config.api_key and self.config.base_url)
 
+    _CANTONESE_MARKERS = set("係唔嘅咗喺冇畀佢哋咩咁啲嚟搵睇諗嘢喔喇喎㗎")
+
     def translate(self, text: str, channel_name: str = "Live TV", is_final: bool = True) -> str:
         clean = text.strip()
         if not clean:
             return ""
 
-        # If input is already predominantly Chinese, return as-is
+        # Check for Japanese Kana, Korean Hangul, or Cantonese markers before CJK skip check
+        has_ja_ko = any(
+            ("\u3040" <= c <= "\u30ff")
+            or ("\uff66" <= c <= "\uff9f")
+            or ("\uac00" <= c <= "\ud7af")
+            for c in clean
+        )
+        has_cantonese = any(c in self._CANTONESE_MARKERS for c in clean)
+
+        # If input is already predominantly Mandarin Chinese (no Kana/Hangul/Cantonese), return as-is
         cjk_chars = sum(1 for c in clean if "\u4e00" <= c <= "\u9fff")
-        if cjk_chars > len(clean) * 0.55:
+        if cjk_chars > len(clean) * 0.55 and not has_ja_ko and not has_cantonese:
             return clean
 
         if not self.is_llm_ready:
@@ -345,6 +356,11 @@ class StreamingSpeechPipeline:
         "WTO", "IMF", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
     }
 
+    _NOISE_SINGLE_WORDS = {
+        "the", "a", "an", "to", "of", "in", "on", "and", "or", "is", "it",
+        "uh", "um", "ah", "oh", "hmm", "hm", "mm", "eh", "ha", "language",
+    }
+
     def __init__(
         self,
         models_dir: Optional[Path] = None,
@@ -430,8 +446,10 @@ class StreamingSpeechPipeline:
 
         self._vad_remainder = np.zeros(0, dtype=np.float32)
         self._speech_accum = np.zeros(0, dtype=np.float32)
+        self._rolling_rms: float = 0.04
         self._pending_clauses: List[str] = []
         self._pending_first_ts: float = 0.0
+        self._pending_wait_samples: int = 0
         self._pending_last_asr_ms: float = 480.0
         self._samples_since_vad_pop: int = 0
         self._last_interim_emit_ts = 0.0
@@ -467,11 +485,11 @@ class StreamingSpeechPipeline:
     def _init_vad(self) -> None:
         silero_cfg = sherpa_onnx.SileroVadModelConfig(
             model=str(self.vad_model_path),
-            threshold=0.38,
-            min_silence_duration=0.48,
+            threshold=0.45,
+            min_silence_duration=0.32,
             min_speech_duration=0.25,
             window_size=512,
-            max_speech_duration=8.5,
+            max_speech_duration=5.5,
         )
         vad_cfg = sherpa_onnx.VadModelConfig(
             silero_vad=silero_cfg,
@@ -490,8 +508,10 @@ class StreamingSpeechPipeline:
             self.vad.reset()
         self._vad_remainder = np.zeros(0, dtype=np.float32)
         self._speech_accum = np.zeros(0, dtype=np.float32)
+        self._rolling_rms = 0.04
         self._pending_clauses = []
         self._pending_first_ts = 0.0
+        self._pending_wait_samples = 0
         self._pending_last_asr_ms = 480.0
         self._samples_since_vad_pop = 0
         self._last_interim_emit_ts = 0.0
@@ -566,6 +586,7 @@ class StreamingSpeechPipeline:
 
         if not self._pending_clauses:
             self._pending_first_ts = now
+            self._pending_wait_samples = 0
 
         # Check if previous buffered clause ended WITHOUT terminal punctuation (i.e. mid-sentence continuation)
         # OR if the new clause starts with a lowercase letter (meaning ASR itself detected continuation)
@@ -619,8 +640,12 @@ class StreamingSpeechPipeline:
         is_complete = self._is_pending_grammatically_complete()
         min_words, max_words, silence_flush_sec, max_wait_sec = self._get_mode_thresholds()
 
-        # 1. Hard cap on total words or waiting duration so subtitles never fall too far behind
-        if word_count >= max_words or (now - self._pending_first_ts) >= max_wait_sec:
+        # 1. Hard cap on total words or waiting duration (both wall-clock & stream audio duration)
+        wait_sec = max(
+            (now - self._pending_first_ts) if self._pending_first_ts > 0 else 0.0,
+            self._pending_wait_samples / 16000.0,
+        )
+        if word_count >= max_words or wait_sec >= max_wait_sec:
             return True
 
         # 2. Target full-sentence length reached and grammatically complete
@@ -642,8 +667,15 @@ class StreamingSpeechPipeline:
         post_silence_ms = (self._samples_since_vad_pop / 16000.0) * 1000.0
         self._pending_clauses = []
         self._pending_first_ts = 0.0
+        self._pending_wait_samples = 0
         self._samples_since_vad_pop = 0
         if not combined or len(combined.strip(" .,?!。，？！")) < 2:
+            return None
+
+        # Filter standalone single-word noise hallucinations ("the.", "a.", "language.")
+        latin_tokens = re.findall(r"[A-Za-z\u00C0-\u017F]+", combined.lower())
+        has_cjk = any("\u3040" <= c <= "\u9fff" or "\uac00" <= c <= "\ud7af" for c in combined)
+        if len(latin_tokens) == 1 and not has_cjk and latin_tokens[0] in self._NOISE_SINGLE_WORDS:
             return None
 
         if combined[-1] not in ".?!。？！":
@@ -755,14 +787,27 @@ class StreamingSpeechPipeline:
         while idx + window_size <= len(buf):
             win = buf[idx : idx + window_size]
             idx += window_size
+            win_rms = float(np.sqrt(np.mean(win * win)))
+            self._rolling_rms = 0.92 * self._rolling_rms + 0.08 * max(0.005, win_rms)
+
             self.vad.accept_waveform(win)
             speaking_now = self.vad.is_speech_detected()
+
+            if self._pending_clauses:
+                self._pending_wait_samples += window_size
 
             if speaking_now:
                 self._samples_since_vad_pop = 0
                 self._speech_accum = np.concatenate([self._speech_accum, win])
-                if len(self._speech_accum) > 16000 * 12:
-                    self._speech_accum = self._speech_accum[-16000 * 12 :]
+                accum_sec = len(self._speech_accum) / float(sample_rate)
+                # Prevent Silero-VAD "0 pops" deadlock on continuous TV speech/music:
+                # Force segment cut at natural energy dip after 3.2s, or hard cut at 4.8s
+                if (
+                    accum_sec >= 3.2 and win_rms < max(0.015, self._rolling_rms * 0.45)
+                ) or accum_sec >= 4.8:
+                    self.vad.flush()
+                    self._speech_accum = np.zeros(0, dtype=np.float32)
+                    speaking_now = False
             elif self._pending_clauses:
                 self._samples_since_vad_pop += window_size
 
@@ -791,12 +836,14 @@ class StreamingSpeechPipeline:
                     if ev is not None:
                         events.append(ev)
 
-            # 2. If we have buffered clauses waiting for continuation, check if silence timeout expired
-            if self._pending_clauses and not speaking_now:
-                post_silence_sec = self._samples_since_vad_pop / float(sample_rate)
+            # 2. Check if buffered clauses should flush (by silence timeout OR max_wait_sec during continuous speech)
+            if self._pending_clauses:
+                post_silence_sec = (
+                    0.0 if speaking_now else (self._samples_since_vad_pop / float(sample_rate))
+                )
                 if self._should_flush_pending(
                     now=now,
-                    is_currently_speaking=False,
+                    is_currently_speaking=speaking_now,
                     post_vad_silence_sec=post_silence_sec,
                 ):
                     ev = self._flush_pending_to_event()

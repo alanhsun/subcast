@@ -16,12 +16,125 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional
-from urllib.parse import quote, urljoin
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
+
+import httpx
 
 from server.ai_pipeline import StreamingSpeechPipeline, SubtitleEvent
 from server.playlist_parser import encode_url_token
 
 _URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
+_BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)", re.IGNORECASE)
+_FFMPEG_EXTRA_ARGS_CACHE: dict[str, List[str]] = {}
+
+
+def _unwrap_beacon_url(url: str) -> str:
+    """Unwraps Amagi/Rakuten /beacon/...?redirect_url=... tracking URLs to direct .ts/.m3u8 URLs."""
+    if "redirect_url=" not in url:
+        return url
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        redir = qs.get("redirect_url", [""])[0]
+        if redir:
+            unq = unquote(redir)
+            if unq.startswith(("http://", "https://")):
+                return unq
+    except Exception:
+        pass
+    return url
+
+
+def resolve_best_audio_stream_url(url: str, timeout: float = 5.5) -> str:
+    """
+    Resolves a Master M3U8 into its single best audio sub-playlist URL so FFmpeg does not:
+    1) Download all 4~8 video resolution variants simultaneously (causing 15-25s timeouts),
+    2) Miss demuxed audio tracks (#EXT-X-MEDIA:TYPE=AUDIO,URI="..."), or
+    3) Abort on dead subtitle sub-playlists (#EXT-X-MEDIA:TYPE=SUBTITLES -> 404).
+    """
+    clean_url = _unwrap_beacon_url(url)
+    if ".m3u8" not in clean_url.lower():
+        return clean_url
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=timeout, verify=False) as client:
+            resp = client.get(clean_url, headers=headers)
+            if resp.status_code >= 400:
+                return clean_url
+            base_url = str(resp.url)
+            text = resp.text
+            if "#EXT-X-STREAM-INF" not in text and "#EXT-X-MEDIA" not in text:
+                return base_url
+
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+            # 1. Check for dedicated #EXT-X-MEDIA:TYPE=AUDIO playlist (e.g. NHK World, NTV News24, Weathernews, TalkTV)
+            audio_candidates: List[tuple[int, str]] = []
+            for line in lines:
+                if line.upper().startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line.upper():
+                    m = _URI_ATTR_RE.search(line)
+                    if m:
+                        a_url = _unwrap_beacon_url(urljoin(base_url, m.group(1)))
+                        prio = 0 if "DEFAULT=YES" in line.upper() else 1
+                        audio_candidates.append((prio, a_url))
+            audio_candidates.sort(key=lambda x: x[0])
+            for _, a_url in audio_candidates:
+                try:
+                    r_aud = client.get(a_url, headers=headers)
+                    if r_aud.status_code < 400 and "#EXTINF" in r_aud.text:
+                        return str(r_aud.url)
+                except Exception:
+                    pass
+
+            # 2. Otherwise pick the lowest-bandwidth working #EXT-X-STREAM-INF variant for fast audio extraction
+            variants: List[tuple[int, str]] = []
+            for i, line in enumerate(lines):
+                if line.upper().startswith("#EXT-X-STREAM-INF"):
+                    bw_m = _BANDWIDTH_RE.search(line)
+                    bw = int(bw_m.group(1)) if bw_m else 99999999
+                    for j in range(i + 1, len(lines)):
+                        if not lines[j].startswith("#"):
+                            v_url = _unwrap_beacon_url(urljoin(base_url, lines[j]))
+                            variants.append((bw, v_url))
+                            break
+            if variants:
+                variants.sort(key=lambda x: x[0])
+                for _, v_url in variants[:3]:
+                    try:
+                        r_var = client.get(v_url, headers=headers)
+                        if r_var.status_code < 400 and "#EXTM3U" in r_var.text.upper():
+                            return str(r_var.url)
+                    except Exception:
+                        pass
+                return variants[0][1]
+    except Exception:
+        pass
+    return clean_url
+
+
+def _get_ffmpeg_extra_args(ffmpeg_bin: str) -> List[str]:
+    """Detects FFmpeg version support for HLS extension bypass flags (FFmpeg 5.x/6.x/7.x)."""
+    if ffmpeg_bin in _FFMPEG_EXTRA_ARGS_CACHE:
+        return list(_FFMPEG_EXTRA_ARGS_CACHE[ffmpeg_bin])
+    extra: List[str] = []
+    try:
+        res = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-h", "demuxer=hls"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        help_text = (res.stdout or "") + (res.stderr or "")
+        if "extension_picky" in help_text:
+            extra.extend(["-extension_picky", "0"])
+        if "allowed_extensions" in help_text:
+            extra.extend(["-allowed_extensions", "ALL"])
+        if "allowed_segment_extensions" in help_text:
+            extra.extend(["-allowed_segment_extensions", "ALL"])
+    except Exception:
+        pass
+    _FFMPEG_EXTRA_ARGS_CACHE[ffmpeg_bin] = extra
+    return list(extra)
 
 
 def rewrite_m3u8_manifest(
@@ -54,11 +167,15 @@ def rewrite_m3u8_manifest(
             if line.upper().startswith("#EXT-X-STREAM-INF"):
                 expect_variant_playlist = True
             if 'URI="' in line:
-                is_media_tag = line.upper().startswith("#EXT-X-MEDIA")
+                upper_line = line.upper()
+                is_media_tag = upper_line.startswith("#EXT-X-MEDIA")
+                is_subtitle_media = is_media_tag and "TYPE=SUBTITLES" in upper_line
 
                 def _replace_uri(match: re.Match) -> str:
                     orig_uri = match.group(1)
-                    abs_uri = urljoin(final_upstream_url, orig_uri)
+                    abs_uri = _unwrap_beacon_url(urljoin(final_upstream_url, orig_uri))
+                    if is_subtitle_media:
+                        return f'URI="{abs_uri}"'
                     if is_media_tag or abs_uri.split("?")[0].lower().endswith(".m3u8"):
                         return f'URI="{_wrap_proxy(abs_uri, True)}"'
                     return f'URI="{abs_uri}"'
@@ -67,7 +184,7 @@ def rewrite_m3u8_manifest(
             out_lines.append(line)
             continue
 
-        abs_url = urljoin(final_upstream_url, line)
+        abs_url = _unwrap_beacon_url(urljoin(final_upstream_url, line))
         lower_path = abs_url.split("?")[0].lower()
         is_sub_m3u8 = expect_variant_playlist or lower_path.endswith(".m3u8")
         expect_variant_playlist = False
@@ -138,7 +255,7 @@ class AudioSidecarManager:
         self,
         pipeline: StreamingSpeechPipeline,
         broadcast_cb: Callable[[dict], Awaitable[None]],
-        idle_timeout_sec: float = 25.0,
+        idle_timeout_sec: float = 75.0,
     ) -> None:
         self.pipeline = pipeline
         self.broadcast_cb = broadcast_cb
@@ -147,6 +264,7 @@ class AudioSidecarManager:
         self.active_channel_id: str = ""
         self.active_channel_name: str = ""
         self.active_upstream_url: str = ""
+        self.active_candidate_urls: List[str] = []
         self.last_touch_time: float = 0.0
         self.manual_pinned: bool = False
 
@@ -183,6 +301,7 @@ class AudioSidecarManager:
         channel_name: str,
         upstream_url: str,
         manual_pin: Optional[bool] = None,
+        candidate_urls: Optional[List[str]] = None,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -193,16 +312,29 @@ class AudioSidecarManager:
             is_same = (
                 self._worker_thread is not None
                 and self._worker_thread.is_alive()
-                and self.active_upstream_url == upstream_url
+                and (
+                    self.active_upstream_url == upstream_url
+                    or (
+                        bool(channel_id)
+                        and channel_id != "manual"
+                        and self.active_channel_id == channel_id
+                    )
+                )
             )
             if is_same:
                 self.active_channel_name = channel_name or self.active_channel_name
                 return
 
+            dedup_candidates: List[str] = []
+            for u in [upstream_url] + list(candidate_urls or []):
+                if u and u not in dedup_candidates:
+                    dedup_candidates.append(u)
+
             self._stop_worker_locked()
             self.active_channel_id = channel_id
             self.active_channel_name = channel_name or "Live Channel"
             self.active_upstream_url = upstream_url
+            self.active_candidate_urls = dedup_candidates
             self._last_subtitle_payload = None
             self._stop_event.clear()
             while not self._translate_queue.empty():
@@ -218,7 +350,7 @@ class AudioSidecarManager:
             self._translate_thread.start()
             self._worker_thread = threading.Thread(
                 target=self._audio_tap_worker,
-                args=(channel_id, self.active_channel_name, upstream_url),
+                args=(channel_id, self.active_channel_name, upstream_url, dedup_candidates),
                 daemon=True,
                 name=f"AudioTap-{channel_id}",
             )
@@ -231,6 +363,7 @@ class AudioSidecarManager:
             self.active_channel_id = ""
             self.active_channel_name = ""
             self.active_upstream_url = ""
+            self.active_candidate_urls = []
 
     def _stop_worker_locked(self) -> None:
         self._stop_event.set()
@@ -334,9 +467,23 @@ class AudioSidecarManager:
             except Exception as exc:
                 print(f"[Sidecar] Translation worker error: {exc}")
 
-    def _audio_tap_worker(self, channel_id: str, channel_name: str, upstream_url: str) -> None:
+    def _audio_tap_worker(
+        self,
+        channel_id: str,
+        channel_name: str,
+        upstream_url: str,
+        candidate_urls: Optional[List[str]] = None,
+    ) -> None:
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        print(f"[Sidecar] Starting audio tap for [{channel_name}] -> {upstream_url}")
+        extra_hls_args = _get_ffmpeg_extra_args(ffmpeg_bin)
+        candidates = [u for u in (candidate_urls or [upstream_url]) if u]
+        if not candidates:
+            candidates = [upstream_url]
+
+        print(
+            f"[Sidecar] Starting audio tap for [{channel_name}] "
+            f"(candidates={len(candidates)}) -> {candidates[0]}"
+        )
         self.pipeline.reset_stream(channel_name=channel_name)
         self.pipeline.async_translate_mode = True
 
@@ -353,70 +500,113 @@ class AudioSidecarManager:
             delay_ms=0,
         )
 
-        is_http = upstream_url.lower().startswith(("http://", "https://"))
-        is_hls = ".m3u8" in upstream_url.lower()
-        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
-        if is_http:
-            cmd.extend(
-                [
-                    "-reconnect",
-                    "1",
-                    "-reconnect_streamed",
-                    "1",
-                    "-reconnect_delay_max",
-                    "4",
-                    "-rw_timeout",
-                    "12000000",
-                    "-user_agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.0",
-                ]
-            )
-        if is_hls:
-            # Start FFmpeg audio tap at the newest live edge segment (-1) so AI transcription
-            # naturally runs 3~6s ahead of the TV video player's 2~3 segment buffer.
-            cmd.extend(["-live_start_index", "-1"])
-        cmd.extend(
-            [
-                "-i",
-                upstream_url,
-                "-vn",
-                "-sn",
-                "-dn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-f",
-                "s16le",
-                "pipe:1",
-            ]
-        )
-
+        cand_idx = 0
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=6400,
-            )
-            with self._lock:
-                if self._stop_event.is_set():
-                    proc.kill()
-                    return
-                self._ffmpeg_proc = proc
-
-            chunk_size = 3200  # 100ms of 16kHz 16-bit mono PCM
-            assert proc.stdout is not None
             while not self._stop_event.is_set():
-                pcm_chunk = proc.stdout.read(chunk_size)
-                if not pcm_chunk:
+                raw_url = candidates[cand_idx % len(candidates)]
+                cand_idx += 1
+                is_http = raw_url.lower().startswith(("http://", "https://"))
+                target_url = resolve_best_audio_stream_url(raw_url) if is_http else raw_url
+                is_hls = ".m3u8" in target_url.lower() or ".m3u8" in raw_url.lower()
+
+                with self._lock:
+                    if self._stop_event.is_set():
+                        return
+                    self.active_upstream_url = target_url
+
+                cmd = [
+                    ffmpeg_bin,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-probesize",
+                    "1000000",
+                    "-analyzeduration",
+                    "2000000",
+                ]
+                if is_http:
+                    cmd.extend(
+                        [
+                            "-reconnect",
+                            "1",
+                            "-reconnect_streamed",
+                            "1",
+                            "-reconnect_delay_max",
+                            "4",
+                            "-rw_timeout",
+                            "12000000",
+                            "-user_agent",
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4",
+                        ]
+                    )
+                if is_hls:
+                    cmd.extend(extra_hls_args)
+                    # Start FFmpeg audio tap at the newest live edge segment (-1) so AI transcription
+                    # naturally runs 3~6s ahead of the TV video player's 2~3 segment buffer.
+                    cmd.extend(["-live_start_index", "-1"])
+                cmd.extend(
+                    [
+                        "-i",
+                        target_url,
+                        "-vn",
+                        "-sn",
+                        "-dn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-f",
+                        "s16le",
+                        "pipe:1",
+                    ]
+                )
+
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        bufsize=6400,
+                    )
+                    with self._lock:
+                        if self._stop_event.is_set():
+                            proc.kill()
+                            return
+                        self._ffmpeg_proc = proc
+
+                    chunk_size = 3200  # 100ms of 16kHz 16-bit mono PCM
+                    assert proc.stdout is not None
+                    while not self._stop_event.is_set():
+                        pcm_chunk = proc.stdout.read(chunk_size)
+                        if not pcm_chunk:
+                            break
+                        events = self.pipeline.feed_pcm_s16le(pcm_chunk)
+                        for ev in events:
+                            try:
+                                self._translate_queue.put_nowait(ev)
+                            except queue.Full:
+                                pass
+                except Exception as inner_exc:
+                    print(f"[Sidecar] Audio tap attempt error on [{channel_name}] ({target_url}): {inner_exc}")
+                finally:
+                    with self._lock:
+                        if self._ffmpeg_proc is not None:
+                            try:
+                                self._ffmpeg_proc.kill()
+                            except Exception:
+                                pass
+                            self._ffmpeg_proc = None
+
+                # If not global-stopped and this is a network stream, fail over / reconnect
+                if not self._stop_event.is_set() and is_http:
+                    if self._stop_event.wait(1.0):
+                        break
+                    print(
+                        f"[Sidecar] Stream ended or stalled for [{channel_name}], "
+                        f"switching/reconnecting (next candidate #{(cand_idx % len(candidates)) + 1})..."
+                    )
+                else:
                     break
-                events = self.pipeline.feed_pcm_s16le(pcm_chunk)
-                for ev in events:
-                    try:
-                        self._translate_queue.put_nowait(ev)
-                    except queue.Full:
-                        pass
 
         except Exception as exc:
             print(f"[Sidecar] Audio tap error on [{channel_name}]: {exc}")

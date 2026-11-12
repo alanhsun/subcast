@@ -240,7 +240,7 @@ def _resolve_base_url(request: Request) -> str:
 
 
 @app.get("/playlist.m3u")
-async def get_playlist_m3u(request: Request, only_foreign: bool = False, direct_chinese: bool = True) -> Response:
+async def get_playlist_m3u(request: Request, only_foreign: bool = False, direct_chinese: bool = False) -> Response:
     base_url = _resolve_base_url(request)
     body = export_m3u(
         _channels,
@@ -268,7 +268,7 @@ async def get_playlist_foreign_m3u(request: Request) -> Response:
 
 
 @app.get("/playlist.txt")
-async def get_playlist_txt(request: Request, only_foreign: bool = False, direct_chinese: bool = True) -> PlainTextResponse:
+async def get_playlist_txt(request: Request, only_foreign: bool = False, direct_chinese: bool = False) -> PlainTextResponse:
     base_url = _resolve_base_url(request)
     body = export_txt(_channels, base_url, only_foreign=only_foreign, direct_chinese=direct_chinese)
     return PlainTextResponse(content=body, media_type="text/plain; charset=utf-8")
@@ -462,24 +462,61 @@ async def proxy_hls_manifest(
             need_translate = ch.need_translate
             break
 
+    # Collect multi-source backup URLs for the same channel name
+    backup_urls: List[str] = []
+    base_name = name.split(" (源")[0].strip()
+    for ch in _channels:
+        ch_base = (ch.name or "").split(" (源")[0].strip()
+        if ch.id == channel_id or (base_name and ch_base == base_name):
+            if ch.url and ch.url not in backup_urls:
+                backup_urls.append(ch.url)
+
+    candidate_urls: List[str] = [upstream_url]
+    for bu in [root_url] + backup_urls:
+        if bu and bu not in candidate_urls:
+            candidate_urls.append(bu)
+
     sidecar = get_sidecar()
     if need_translate:
-        sidecar.touch_channel(channel_id=channel_id, channel_name=name, upstream_url=root_url)
+        sidecar.touch_channel(
+            channel_id=channel_id,
+            channel_name=name,
+            upstream_url=upstream_url,
+            candidate_urls=candidate_urls,
+        )
     elif sidecar.active_channel_id and not sidecar.manual_pinned:
         sidecar.stop_current()
         await hub.broadcast({"type": "clear"})
 
     headers = {
         "User-Agent": request.headers.get(
-            "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.0"
+            "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"
         )
     }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, verify=False) as client:
-        resp = await client.get(upstream_url, headers=headers)
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail="Upstream M3U8 error")
-        final_url = str(resp.url)
-        text = resp.text
+    urls_to_fetch = [upstream_url]
+    if upstream_url == root_url:
+        for bu in backup_urls:
+            if bu.lower().endswith(".m3u8") or "m3u8" in bu.lower():
+                if bu not in urls_to_fetch:
+                    urls_to_fetch.append(bu)
+
+    final_url = upstream_url
+    text = ""
+    last_status = 502
+    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0, verify=False) as client:
+        for try_url in urls_to_fetch:
+            try:
+                resp = await client.get(try_url, headers=headers)
+                last_status = resp.status_code
+                if resp.status_code < 400 and resp.text.strip():
+                    final_url = str(resp.url)
+                    text = resp.text
+                    break
+            except Exception:
+                continue
+
+    if not text:
+        raise HTTPException(status_code=last_status, detail="Upstream M3U8 error across all sources")
 
     if need_translate:
         sidecar.update_hls_manifest_metrics(text)
