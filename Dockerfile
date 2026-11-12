@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LINGUARELAY_PORT=8765 \
     LINGUARELAY_UDP_PORT=8766 \
     LINGUARELAY_HOST_IP="" \
-    LINGUARELAY_EPG_URL="https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml" \
+    LINGUARELAY_EPG_URL="" \
     LINGUARELAY_LLM_BASE_URL="https://api.minimaxi.com/v1" \
     LINGUARELAY_LLM_MODEL="MiniMax-M3.1-Flash"
 

@@ -21,6 +21,7 @@ _CHINESE_GROUPS = {
     "央视频道",
     "卫视频道",
     "地方频道",
+    "4K超高清",
     "台湾",
     "电影频道",
     "纪录频道",
@@ -277,21 +278,27 @@ def export_m3u(
     extra_epg_url: str = "",
 ) -> str:
     base = base_url.rstrip("/")
-    url_list = [f"{base}/epg.xml.gz", f"{base}/epg.xml"]
-    for u in (extra_epg_url or "https://epg.112114.xyz/pp.xml.gz").split(","):
-        u = u.strip()
-        if u and u not in url_list and "{name}" not in u:
-            url_list.append(u)
-    epg_urls = ",".join(url_list)
+    if extra_epg_url:
+        url_list = [f"{base}/epg.xml.gz", f"{base}/epg.xml"]
+        for u in extra_epg_url.split(","):
+            u = u.strip()
+            if u and u not in url_list and "{name}" not in u:
+                url_list.append(u)
+        epg_urls = ",".join(url_list)
+    else:
+        # Emit a single clean XMLTV URL by default so TVBox / 影视仓 never 404s on comma-joined URLs
+        epg_urls = f"{base}/epg.xml.gz"
     out = [f'#EXTM3U x-tvg-url="{epg_urls}" url-tvg="{epg_urls}"']
     for ch in channels:
         if only_foreign and not ch.need_translate:
             continue
         attrs = []
-        tvg_id = ch.tvg_id or ch.name
-        tvg_name = ch.tvg_name or ch.name
-        attrs.append(f'tvg-id="{tvg_id}"')
-        attrs.append(f'tvg-name="{tvg_name}"')
+        base_ch_name = ch.name.split(" (源")[0].strip() if ch.name else ""
+        canonical_id = ch.tvg_id or base_ch_name or ch.name
+        # Set both tvg-id and tvg-name to canonical_id so TVBox / 影视仓 XMLTV & DIYP EPG
+        # match <programme channel="canonical_id"> identically for foreign and domestic channels.
+        attrs.append(f'tvg-id="{canonical_id}"')
+        attrs.append(f'tvg-name="{canonical_id}"')
         if ch.logo:
             attrs.append(f'tvg-logo="{ch.logo}"')
         if ch.group:

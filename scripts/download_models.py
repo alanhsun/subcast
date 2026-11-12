@@ -143,6 +143,7 @@ def download_file(url: str, dest: Path, desc: str = "") -> None:
 
 
 SEED_PLAYLIST_VERSION = "2.4.3"
+SEED_EPG_VERSION = "2.4.4"
 
 
 def ensure_seed_data() -> None:
@@ -178,11 +179,16 @@ def ensure_seed_data() -> None:
     seed_epg_gz = SEED_DATA_DIR / "epg.xml.gz"
     dst_epg_gz = DATA_DIR / "epg.xml.gz"
     dst_epg_xml = DATA_DIR / "epg.xml"
+    epg_ver_file = DATA_DIR / ".seed_epg_version"
+    cur_epg_ver = epg_ver_file.read_text(encoding="utf-8").strip() if epg_ver_file.exists() else ""
     if seed_epg_gz.exists():
-        if not dst_epg_gz.exists():
+        if not dst_epg_gz.exists() or cur_epg_ver != SEED_EPG_VERSION:
             shutil.copy2(seed_epg_gz, dst_epg_gz)
-            print("[Init] Seeded EPG archive into data/epg.xml.gz")
-        if not dst_epg_xml.exists() and dst_epg_gz.exists():
+            with gzip.open(dst_epg_gz, "rb") as f_in, open(dst_epg_xml, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            epg_ver_file.write_text(SEED_EPG_VERSION, encoding="utf-8")
+            print(f"[Init] Seeded/upgraded global EPG archive (v{SEED_EPG_VERSION}) -> data/epg.xml(.gz)")
+        elif not dst_epg_xml.exists() and dst_epg_gz.exists():
             with gzip.open(dst_epg_gz, "rb") as f_in, open(dst_epg_xml, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
             print("[Init] Decompressed data/epg.xml.gz -> data/epg.xml")

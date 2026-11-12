@@ -112,15 +112,38 @@ class UDPDiscoveryProtocol(asyncio.DatagramProtocol):
             self.transport.sendto(reply, addr)
 
 
+LEGACY_DOMESTIC_EPG_URLS = {
+    "https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml",
+    "https://epg.112114.xyz/pp.xml.gz",
+    "https://live.fanmingming.com/e.xml",
+}
+
+DEFAULT_EPG_SOURCE_URL = (
+    "https://epg.112114.xyz/pp.xml.gz,"
+    "https://epg.pw/xmltv/epg_HK.xml.gz,"
+    "https://epg.pw/xmltv/epg_TW.xml.gz,"
+    "https://epg.pw/xmltv/epg_SG.xml.gz,"
+    "https://epg.pw/xmltv/epg_GB.xml.gz,"
+    "https://epg.pw/xmltv/epg_CA.xml.gz,"
+    "https://epg.pw/xmltv/epg_DE.xml.gz,"
+    "https://epg.pw/xmltv/epg_FR.xml.gz,"
+    "https://epg.pw/xmltv/epg_JP.xml.gz,"
+    "https://epg.pw/xmltv/epg_AU.xml.gz,"
+    "https://epg.pw/xmltv/epg_US.xml.gz"
+)
+
 hub = ConnectionHub()
 _pipeline: Optional[StreamingSpeechPipeline] = None
 _sidecar: Optional[AudioSidecarManager] = None
 _channels: List[ChannelEntry] = []
-_epg_source_url: str = os.environ.get(
-    "LINGUARELAY_EPG_URL",
-    "https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml",
-).strip()
+_raw_env_epg = os.environ.get("LINGUARELAY_EPG_URL", "").strip()
+_epg_source_url: str = (
+    DEFAULT_EPG_SOURCE_URL
+    if (not _raw_env_epg or _raw_env_epg in LEGACY_DOMESTIC_EPG_URLS)
+    else _raw_env_epg
+)
 _epg_last_sync: str = ""
+_epg_sync_lock: Optional[asyncio.Lock] = None
 
 
 def load_channels_from_disk() -> List[ChannelEntry]:
@@ -145,8 +168,11 @@ def load_settings_into_sidecar(sidecar: AudioSidecarManager) -> None:
             sidecar.display_mode = str(data.get("display_mode", "bilingual"))
             sidecar.font_scale = float(data.get("font_scale", 1.0))
             sidecar.auto_sync = bool(data.get("auto_sync", True))
-            if data.get("epg_source_url"):
-                _epg_source_url = str(data["epg_source_url"]).strip()
+            saved_epg = str(data.get("epg_source_url") or "").strip()
+            if saved_epg and saved_epg not in LEGACY_DOMESTIC_EPG_URLS:
+                _epg_source_url = saved_epg
+            else:
+                _epg_source_url = DEFAULT_EPG_SOURCE_URL
             smode = str(data.get("sentence_mode", "full_sentence"))
             if smode in ("full_sentence", "paragraph", "fast_clause"):
                 sidecar.sentence_mode = smode
@@ -202,12 +228,39 @@ def get_sidecar() -> AudioSidecarManager:
     return _sidecar
 
 
+async def _epg_auto_sync_loop() -> None:
+    """Automatically refreshes domestic + international EPG on boot (if stale) and every 12 hours."""
+    await asyncio.sleep(6.0)
+    while True:
+        try:
+            epg_file = DATA_DIR / "epg.xml"
+            need_sync = not epg_file.exists() or not _epg_last_sync
+            if epg_file.exists():
+                age_hours = (time.time() - epg_file.stat().st_mtime) / 3600.0
+                if age_hours >= 12.0:
+                    need_sync = True
+            if need_sync and _epg_source_url:
+                print("[EPG] Auto-syncing domestic & international XMLTV schedules in background...")
+                res = await sync_remote_epg(_epg_source_url)
+                print(
+                    f"[EPG] Auto-sync finished: ok={res.get('ok')}, "
+                    f"channels={res.get('channel_count')}, progs={res.get('programme_count')}"
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"[EPG] Auto-sync warning: {exc}")
+        await asyncio.sleep(12 * 3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_channels_from_disk()
+    _ensure_epg_cache()
     sidecar = get_sidecar()
     loop = asyncio.get_running_loop()
     sidecar.attach_loop(loop)
+    epg_task = loop.create_task(_epg_auto_sync_loop())
 
     udp_transport = None
     try:
@@ -223,6 +276,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    epg_task.cancel()
     sidecar.stop_current()
     if udp_transport:
         udp_transport.close()
@@ -247,7 +301,6 @@ async def get_playlist_m3u(request: Request, only_foreign: bool = False, direct_
         base_url,
         only_foreign=only_foreign,
         direct_chinese=direct_chinese,
-        extra_epg_url=_epg_source_url,
     )
     return Response(
         content=body.encode("utf-8"),
@@ -259,7 +312,7 @@ async def get_playlist_m3u(request: Request, only_foreign: bool = False, direct_
 @app.get("/playlist_foreign.m3u")
 async def get_playlist_foreign_m3u(request: Request) -> Response:
     base_url = _resolve_base_url(request)
-    body = export_m3u(_channels, base_url, only_foreign=True, extra_epg_url=_epg_source_url)
+    body = export_m3u(_channels, base_url, only_foreign=True)
     return Response(
         content=body.encode("utf-8"),
         media_type="audio/x-mpegurl; charset=utf-8",
@@ -282,7 +335,8 @@ async def get_playlist_foreign_txt(request: Request) -> PlainTextResponse:
 
 
 @app.get("/epg.xml")
-async def get_epg_xml() -> Response:
+@app.get("/epg.xml,{rest:path}")
+async def get_epg_xml(rest: str = "") -> Response:
     _ensure_epg_cache()
     epg_file = DATA_DIR / "epg.xml"
     if epg_file.exists():
@@ -292,7 +346,9 @@ async def get_epg_xml() -> Response:
 
 
 @app.get("/epg.xml.gz")
-async def get_epg_xml_gz() -> Response:
+@app.get("/epg.xml.gz,{rest:path}")
+async def get_epg_xml_gz(rest: str = "") -> Response:
+    _ensure_epg_cache()
     epg_gz = DATA_DIR / "epg.xml.gz"
     if epg_gz.exists():
         return FileResponse(str(epg_gz), media_type="application/gzip", filename="epg.xml.gz")
@@ -300,62 +356,253 @@ async def get_epg_xml_gz() -> Response:
 
 
 _epg_cache_mtime: float = 0.0
+_epg_checked_date: str = ""
 _epg_alias_map: dict[str, str] = {}
 _epg_prog_map: dict[str, list[tuple[str, str, str, str]]] = {}
 
+_EXTRA_FOREIGN_EPG_ALIASES: dict[str, list[str]] = {
+    "BBC News英国广播公司": ["BBC NEWS HD", "BBC World News", "BBC News Channel"],
+    "CNN国际新闻": ["CNN International", "CNN", "CNN HD"],
+    "Sky News天空新闻": ["Sky News HD", "Sky News"],
+    "Fox News福克斯新闻": ["FOX News Channel", "Fox News Channel", "Fox News Channel HD"],
+    "LiveNOW from FOX福克斯现场": ["LiveNOW from FOX", "FOX News Channel", "Fox News Channel HD"],
+    "FOX Weather福克斯气象": ["FOX Weather"],
+    "Al Jazeera English半岛电视台(英语)": ["Al Jazeera English", "Al Jazeera English HD"],
+    "Al Jazeera Arabic半岛电视台(阿语)": ["Al Jazeera", "Al Jazeera Arabic"],
+    "NHK World-Japan日本国际台(英语)": ["NHKワールド JAPAN", "NHK WORLD-JAPAN", "NHK WORLD"],
+    "NHK World Premium日本世界台(日语)": ["NHK World Premium", "NHKワールド・プレミアム"],
+    "日テレNEWS24日本电视新闻(日语)": ["日テレNEWS24", "日テレNEWS24 HD"],
+    "CNA亚洲新闻台": ["Channel NewsAsia", "CNA", "CNA HD"],
+    "CNA Originals亚洲新闻纪实": ["CNA", "Channel NewsAsia"],
+    "DW德国之声(英语)": ["DW English", "DW (English)", "DW"],
+    "DW Español德国之声(西语)": ["DW Español", "DW (Español)", "DW"],
+    "France 24 English法兰西24(英语)": ["France 24 English", "France 24 (engl.)", "FRANCE 24 English"],
+    "France 24 Français法兰西24(法语)": ["France 24 Français", "France 24 (franz.)", "FRANCE 24"],
+    "France 24 Español法兰西24(西语)": ["France 24 Español", "France 24 Espanol"],
+    "ABC News澳洲新闻": ["ABC NEWS", "ABC News"],
+    "Ausbiz澳洲财经新闻": ["ausbiz", "Ausbiz"],
+    "翡翠台": ["翡翠台", "TVB Jade"],
+    "黄金翡翠台": ["黃金翡翠台", "黄金翡翠台"],
+    "无线新闻台": ["無綫新聞台", "TVB News"],
+    "有线新闻台": ["有線新聞台", "HOY資訊台", "HOY 資訊台"],
+}
+
+
+def _norm_epg_key(s: str) -> str:
+    import re as _re
+
+    return _re.sub(r"[\s\-_HD高清频道台()（）【】\[\]]+", "", (s or "").upper())
+
+
+def _to_utc8_xmltv_ts(ts_raw: str) -> str:
+    """Converts any XMLTV timestamp (e.g. '20261112010000 +0000') to Beijing Time ('YYYYMMDDHHMMSS +0800')."""
+    import datetime as _dt
+    import re as _re
+
+    s = (ts_raw or "").strip()
+    m = _re.match(r"^(\d{12,14})(?:\s*([+-]\d{4}))?", s)
+    if not m:
+        return s
+    digits = m.group(1)
+    if len(digits) == 12:
+        digits += "00"
+    else:
+        digits = digits[:14]
+    tz_str = m.group(2) or "+0800"
+    if tz_str == "+0800":
+        return f"{digits} +0800"
+    try:
+        sign = 1 if tz_str[0] == "+" else -1
+        off_min = sign * (int(tz_str[1:3]) * 60 + int(tz_str[3:5]))
+        src_tz = _dt.timezone(_dt.timedelta(minutes=off_min))
+        dst_tz = _dt.timezone(_dt.timedelta(hours=8))
+        dt = _dt.datetime(
+            int(digits[0:4]),
+            int(digits[4:6]),
+            int(digits[6:8]),
+            int(digits[8:10]),
+            int(digits[10:12]),
+            int(digits[12:14]),
+            tzinfo=src_tz,
+        ).astimezone(dst_tz)
+        return f"{dt.strftime('%Y%m%d%H%M%S')} +0800"
+    except Exception:
+        return f"{digits} +0800"
+
+
+def _synthesize_day_slots(
+    cid: str,
+    existing_progs: list[tuple[str, str, str, str]],
+    target_days: list[str],
+) -> list[tuple[str, str, str, str]]:
+    """
+    Ensures every playlist channel has valid UTC+8 XMLTV <programme> entries on `target_days` (today & tomorrow).
+    - If historical schedule entries exist for `cid`, shifts its latest full day's timetable onto missing days.
+    - Otherwise generates clean 2-hour live broadcast blocks so 24/7 rolling channels never appear blank in TVBox.
+    """
+    import datetime as _dt
+
+    existing_dates = {st[:8] for st, _, _, _ in existing_progs if len(st) >= 8}
+    missing_days = [d for d in target_days if d not in existing_dates]
+    if not missing_days:
+        return []
+
+    added: list[tuple[str, str, str, str]] = []
+    # Prefer shifting from a date with >= 4 programmes
+    date_counts: dict[str, int] = {}
+    for st, _, _, _ in existing_progs:
+        if len(st) >= 8:
+            date_counts[st[:8]] = date_counts.get(st[:8], 0) + 1
+    rich_dates = sorted(d for d, cnt in date_counts.items() if cnt >= 4)
+    ref_d = rich_dates[-1] if rich_dates else (sorted(date_counts.keys())[-1] if date_counts else "")
+
+    if ref_d:
+        ref_dt = _dt.date(int(ref_d[:4]), int(ref_d[4:6]), int(ref_d[6:8]))
+        template = [p for p in existing_progs if p[0].startswith(ref_d)]
+        for md in missing_days:
+            target_dt = _dt.date(int(md[:4]), int(md[4:6]), int(md[6:8]))
+            delta = target_dt - ref_dt
+            for st, et, tit, dsc in template:
+                try:
+                    st_d = _dt.date(int(st[:4]), int(st[4:6]), int(st[6:8])) + delta
+                    et_d = _dt.date(int(et[:4]), int(et[4:6]), int(et[6:8])) + delta
+                    new_st = f"{st_d.strftime('%Y%m%d')}{st[8:14]} +0800"
+                    new_et = f"{et_d.strftime('%Y%m%d')}{et[8:14]} +0800"
+                    added.append((new_st, new_et, tit, dsc))
+                except Exception:
+                    continue
+        if added:
+            return added
+
+    # Clean 2-hour rolling broadcast guide for 24/7 news/live channels with no upstream schedule
+    slot_labels = [
+        ("00:00", "02:00", "午夜整点新闻直播 / Overnight Live"),
+        ("02:00", "04:00", "环球资讯连线 / Global News Desk"),
+        ("04:00", "06:00", "早间国际快讯 / Early Morning Briefing"),
+        ("06:00", "09:00", "早安新闻现场 / Morning Live"),
+        ("09:00", "12:00", "上午环球直播 / Daytime Live"),
+        ("12:00", "14:00", "午间国际新闻 / Midday Report"),
+        ("14:00", "17:00", "下午焦点追踪 / Afternoon Live"),
+        ("17:00", "19:00", "傍晚财经与国际视野 / Evening Briefing"),
+        ("19:00", "21:00", "黄金档深度报道 / Prime Time News"),
+        ("21:00", "24:00", "晚间环球直播间 / Tonight Live"),
+    ]
+    for md in missing_days:
+        next_d = (
+            _dt.date(int(md[:4]), int(md[4:6]), int(md[6:8])) + _dt.timedelta(days=1)
+        ).strftime("%Y%m%d")
+        for sh, eh, label in slot_labels:
+            st_s = f"{md}{sh.replace(':', '')}00 +0800"
+            et_s = f"{next_d}000000 +0800" if eh == "24:00" else f"{md}{eh.replace(':', '')}00 +0800"
+            added.append((st_s, et_s, f"{cid} · {label}", "声幕 SubCast 实时双语字幕支持频道"))
+    return added
+
 
 def _ensure_epg_cache() -> None:
-    global _epg_cache_mtime, _epg_alias_map, _epg_prog_map
+    global _epg_cache_mtime, _epg_checked_date, _epg_alias_map, _epg_prog_map
+    import datetime as _dt
+    import gzip as _gzip
+    import shutil as _shutil
+    import xml.etree.ElementTree as _ET
+
     epg_file = DATA_DIR / "epg.xml"
     epg_gz = DATA_DIR / "epg.xml.gz"
     if not epg_file.exists() and epg_gz.exists():
         try:
-            import gzip as _gzip
-            import shutil as _shutil
-
             with _gzip.open(str(epg_gz), "rb") as f_in, open(str(epg_file), "wb") as f_out:
                 _shutil.copyfileobj(f_in, f_out)
         except Exception as exc:
             print(f"[EPG] Decompress warning: {exc}")
     if not epg_file.exists():
         return
-    mtime = epg_file.stat().st_mtime
-    if mtime == _epg_cache_mtime and _epg_prog_map:
-        return
-    import re as _re
-    import xml.etree.ElementTree as _ET
 
-    def _norm(s: str) -> str:
-        return _re.sub(r"[\s\-_HD高清频道台()（）【】\[\]]+", "", s.upper())
+    utc8_now = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8)))
+    today_str = utc8_now.strftime("%Y%m%d")
+    tomorrow_str = (utc8_now.date() + _dt.timedelta(days=1)).strftime("%Y%m%d")
+    mtime = epg_file.stat().st_mtime
+    if mtime == _epg_cache_mtime and _epg_checked_date == today_str and _epg_prog_map:
+        return
 
     try:
         root = _ET.parse(str(epg_file)).getroot()
         alias_map: dict[str, str] = {}
+        channel_els: dict[str, _ET.Element] = {}
         prog_map: dict[str, list[tuple[str, str, str, str]]] = {}
+
         for ch_el in root.findall("channel"):
             cid = (ch_el.get("id") or "").strip()
             if not cid:
                 continue
+            channel_els[cid] = ch_el
             alias_map[cid.upper()] = cid
-            alias_map[_norm(cid)] = cid
+            alias_map[_norm_epg_key(cid)] = cid
             for dn_el in ch_el.findall("display-name"):
                 dn = (dn_el.text or "").strip()
                 if dn:
                     alias_map[dn.upper()] = cid
-                    alias_map[_norm(dn)] = cid
+                    alias_map[_norm_epg_key(dn)] = cid
+
+        # Also index all playlist channels (including tvg_name & stripped multi-source names)
+        playlist_cids: dict[str, ChannelEntry] = {}
+        for ch in _channels:
+            base_name = ch.name.split(" (源")[0].strip() if ch.name else ""
+            cid = ch.tvg_id or base_name or ch.name
+            if cid:
+                playlist_cids.setdefault(cid, ch)
+                for k in (cid, ch.name, base_name, ch.tvg_name):
+                    if k:
+                        alias_map.setdefault(k.upper(), cid)
+                        alias_map.setdefault(_norm_epg_key(k), cid)
+
         for pr_el in root.findall("programme"):
             cid = (pr_el.get("channel") or "").strip()
-            st = (pr_el.get("start") or "").strip()
-            et = (pr_el.get("stop") or "").strip()
+            st = _to_utc8_xmltv_ts(pr_el.get("start") or "")
+            et = _to_utc8_xmltv_ts(pr_el.get("stop") or "")
             t_el = pr_el.find("title")
             d_el = pr_el.find("desc")
             tit = (t_el.text or "精彩节目").strip() if t_el is not None else "精彩节目"
             dsc = (d_el.text or "").strip() if d_el is not None else ""
-            if cid and len(st) >= 12 and len(et) >= 12:
+            if cid and len(st) >= 14 and len(et) >= 14:
                 prog_map.setdefault(cid, []).append((st, et, tit, dsc))
+
+        # Ensure every channel in our playlist has valid today & tomorrow entries in BOTH memory AND epg.xml(.gz)
+        xml_dirty = False
+        for cid, ch in playlist_cids.items():
+            if cid not in channel_els:
+                ch_el = _ET.Element("channel", {"id": cid})
+                for dn_val in dict.fromkeys([cid, ch.tvg_name, ch.name.split(" (源")[0].strip()]):
+                    if dn_val:
+                        dn_el = _ET.SubElement(ch_el, "display-name")
+                        dn_el.text = dn_val
+                channel_els[cid] = ch_el
+                root.insert(0, ch_el)
+                xml_dirty = True
+
+            synth = _synthesize_day_slots(cid, prog_map.get(cid, []), [today_str, tomorrow_str])
+            if synth:
+                prog_map.setdefault(cid, []).extend(synth)
+                for new_st, new_et, tit, dsc in synth:
+                    pr_el = _ET.SubElement(
+                        root, "programme", {"start": new_st, "stop": new_et, "channel": cid}
+                    )
+                    t_el = _ET.SubElement(pr_el, "title", {"lang": "zh"})
+                    t_el.text = tit
+                    if dsc:
+                        d_el = _ET.SubElement(pr_el, "desc", {"lang": "zh"})
+                        d_el.text = dsc
+                xml_dirty = True
+
+        if xml_dirty:
+            xml_bytes = _ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            epg_file.write_bytes(xml_bytes)
+            with _gzip.open(str(epg_gz), "wb", compresslevel=6) as gz_out:
+                gz_out.write(xml_bytes)
+            mtime = epg_file.stat().st_mtime
+
         _epg_alias_map = alias_map
         _epg_prog_map = prog_map
         _epg_cache_mtime = mtime
+        _epg_checked_date = today_str
     except Exception as exc:
         print(f"[EPG] Cache load warning: {exc}")
 
@@ -367,20 +614,23 @@ async def get_diyp_epg(
     channel: str = Query("", description="Channel name alias"),
     date: str = Query("", description="Date YYYY-MM-DD"),
 ) -> dict:
-    """DIYP / TVBox (影视仓) compatible JSON EPG endpoint covering all 167 channels in UTC+8."""
+    """DIYP / TVBox (影视仓) compatible JSON EPG endpoint covering all domestic & foreign channels in UTC+8."""
     import datetime as _dt
-    import re as _re
 
     _ensure_epg_cache()
     q_name = (ch or channel or "").strip()
+    q_base = q_name.split(" (源")[0].strip()
     if not date:
-        date = _dt.date.today().strftime("%Y-%m-%d")
+        utc8_today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).date()
+        date = utc8_today.strftime("%Y-%m-%d")
     d_compact = date.replace("-", "")
 
-    def _norm(s: str) -> str:
-        return _re.sub(r"[\s\-_HD高清频道台()（）【】\[\]]+", "", s.upper())
-
-    cid = _epg_alias_map.get(q_name.upper()) or _epg_alias_map.get(_norm(q_name))
+    cid = (
+        _epg_alias_map.get(q_name.upper())
+        or _epg_alias_map.get(q_base.upper())
+        or _epg_alias_map.get(_norm_epg_key(q_name))
+        or _epg_alias_map.get(_norm_epg_key(q_base))
+    )
     progs = _epg_prog_map.get(cid or "", [])
     day_items = []
     for st, et, tit, dsc in progs:
@@ -686,130 +936,271 @@ class EpgSourcePayload(BaseModel):
     url: str
 
 
-async def sync_remote_epg(url_str: str) -> dict:
-    """Download remote XMLTV (.xml / .xml.gz) or validate DIYP EPG URL, merging into local data/epg.xml."""
-    global _epg_source_url, _epg_last_sync, _epg_cache_mtime
+def _parse_and_merge_xmltv_bytes(
+    raw_payloads: list[tuple[str, bytes]],
+    epg_file: Path,
+    epg_gz: Path,
+    playlist_channels: list[ChannelEntry],
+) -> tuple[int, int]:
+    """
+    Runs in a worker thread via asyncio.to_thread so XMLTV decompression & iterparse
+    never block live subtitle WebSocket broadcasts.
+    Maps domestic & international (epg.pw) channel IDs/aliases onto canonical playlist IDs
+    and normalizes all <programme> timestamps to UTC+8 (+0800).
+    """
     import datetime as _dt
     import gzip as _gzip
+    import io as _io
+    import re as _re
     import xml.etree.ElementTree as _ET
+
+    utc8_now = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8)))
+    cutoff_date = (utc8_now.date() - _dt.timedelta(days=1)).strftime("%Y%m%d")
+    today_str = utc8_now.strftime("%Y%m%d")
+    tomorrow_str = (utc8_now.date() + _dt.timedelta(days=1)).strftime("%Y%m%d")
+
+    canonical_meta: dict[str, set[str]] = {}
+    lookup_exact: dict[str, set[str]] = {}
+    lookup_norm: dict[str, set[str]] = {}
+
+    def _reg_alias(alias: str, target_cid: str, allow_norm: bool = True) -> None:
+        a = (alias or "").strip()
+        if not a:
+            return
+        lookup_exact.setdefault(a.upper(), set()).add(target_cid)
+        if allow_norm and not a.isdigit():
+            nk = _norm_epg_key(a)
+            if len(nk) >= 2:
+                lookup_norm.setdefault(nk, set()).add(target_cid)
+
+    for ch in playlist_channels:
+        base_name = ch.name.split(" (源")[0].strip() if ch.name else ""
+        cid = ch.tvg_id or base_name or ch.name
+        if not cid:
+            continue
+        names = canonical_meta.setdefault(cid, set())
+        for val in (cid, base_name, ch.tvg_name):
+            if val:
+                names.add(val)
+                _reg_alias(val, cid)
+
+    for cid, extra_list in _EXTRA_FOREIGN_EPG_ALIASES.items():
+        if cid in canonical_meta:
+            for ex in extra_list:
+                canonical_meta[cid].add(ex)
+                _reg_alias(ex, cid)
+
+    progs_by_ch: dict[str, dict[str, tuple[str, str, str, str]]] = {}
+    if epg_file.exists():
+        try:
+            old_root = _ET.parse(str(epg_file)).getroot()
+            for ch_el in old_root.findall("channel"):
+                cid = (ch_el.get("id") or "").strip()
+                if not cid:
+                    continue
+                is_playlist_ch = cid in canonical_meta
+                if is_playlist_ch:
+                    _reg_alias(cid, cid)
+                for dn_el in ch_el.findall("display-name"):
+                    dn = (dn_el.text or "").strip()
+                    if not dn:
+                        continue
+                    if cid == "Ausbiz澳洲财经新闻" and dn == "3474":
+                        continue
+                    if is_playlist_ch:
+                        canonical_meta[cid].add(dn)
+                        _reg_alias(dn, cid)
+                        m_pw = _re.match(r"^epgpw_[a-z]+_(\d+)$", dn, _re.IGNORECASE)
+                        if m_pw:
+                            _reg_alias(m_pw.group(1), cid, allow_norm=False)
+            for pr_el in old_root.findall("programme"):
+                cid = (pr_el.get("channel") or "").strip()
+                if cid in canonical_meta:
+                    st = _to_utc8_xmltv_ts(pr_el.get("start") or "")
+                    et = _to_utc8_xmltv_ts(pr_el.get("stop") or "")
+                    if len(st) >= 14 and len(et) >= 14 and st[:8] >= cutoff_date:
+                        tit = (pr_el.findtext("title") or "精彩节目").strip()
+                        dsc = (pr_el.findtext("desc") or "").strip()
+                        if dsc == "声幕 SubCast 实时双语字幕支持频道":
+                            continue
+                        progs_by_ch.setdefault(cid, {})[st] = (st, et, tit, dsc)
+        except Exception:
+            pass
+
+    matched_cids_all: set[str] = set()
+    best_remote_cnt: dict[str, int] = {}
+    fetched_progs = 0
+
+    for src_url, raw_bytes in raw_payloads:
+        try:
+            is_gz = raw_bytes[:2] == b"\x1f\x8b" or src_url.lower().split("?")[0].endswith(".gz")
+            remote_to_targets: dict[str, set[str]] = {}
+            rcid_progs: dict[str, list[tuple[str, str, str, str]]] = {}
+
+            bio: _io.BufferedIOBase | _gzip.GzipFile
+            raw_bio = _io.BytesIO(raw_bytes)
+            bio = _gzip.GzipFile(fileobj=raw_bio, mode="rb") if is_gz else raw_bio
+            try:
+                for _, elem in _ET.iterparse(bio, events=("end",)):
+                    tag = elem.tag
+                    if tag == "channel":
+                        rcid = (elem.get("id") or "").strip()
+                        if rcid:
+                            targets: set[str] = set()
+                            if rcid.upper() in lookup_exact:
+                                targets |= lookup_exact[rcid.upper()]
+                            for dn_el in elem.findall("display-name"):
+                                dn = (dn_el.text or "").strip()
+                                if not dn:
+                                    continue
+                                if dn.upper() in lookup_exact:
+                                    targets |= lookup_exact[dn.upper()]
+                                elif not dn.isdigit():
+                                    nk = _norm_epg_key(dn)
+                                    if nk in lookup_norm:
+                                        targets |= lookup_norm[nk]
+                            if targets:
+                                remote_to_targets[rcid] = targets
+                        elem.clear()
+                    elif tag == "programme":
+                        rcid = (elem.get("channel") or "").strip()
+                        if rcid in remote_to_targets:
+                            st = _to_utc8_xmltv_ts(elem.get("start") or "")
+                            et = _to_utc8_xmltv_ts(elem.get("stop") or "")
+                            if len(st) >= 14 and len(et) >= 14 and et[:8] >= cutoff_date:
+                                tit = (elem.findtext("title") or "精彩节目").strip()
+                                dsc = (elem.findtext("desc") or "").strip()
+                                rcid_progs.setdefault(rcid, []).append((st, et, tit, dsc))
+                        elem.clear()
+            finally:
+                bio.close()
+
+            for rcid, plist in rcid_progs.items():
+                future_cnt = sum(1 for st, _, _, _ in plist if st[:8] >= today_str)
+                if future_cnt <= 0:
+                    continue
+                for t_cid in remote_to_targets.get(rcid, ()):
+                    if future_cnt > best_remote_cnt.get(t_cid, 0):
+                        best_remote_cnt[t_cid] = future_cnt
+                        progs_by_ch[t_cid] = {item[0]: item for item in plist}
+                        matched_cids_all.add(t_cid)
+                        fetched_progs += len(plist)
+        except Exception as exc:
+            print(f"[EPG] Parse warning on {src_url}: {exc}")
+
+    base_root = _ET.Element("tv", {"generator-info-name": "SubCast-EPG-Aggregator"})
+    for cid in sorted(canonical_meta.keys()):
+        ch_el = _ET.SubElement(base_root, "channel", {"id": cid})
+        ordered_dns = [cid] + sorted(d for d in canonical_meta[cid] if d and d != cid)
+        for dn_val in ordered_dns:
+            dn_el = _ET.SubElement(ch_el, "display-name")
+            dn_el.text = dn_val
+
+    for cid in sorted(canonical_meta.keys()):
+        existing_list = [
+            v for k, v in sorted(progs_by_ch.get(cid, {}).items()) if k[:8] >= cutoff_date
+        ]
+        synth = _synthesize_day_slots(cid, existing_list, [today_str, tomorrow_str])
+        full_list = sorted(existing_list + synth, key=lambda x: x[0])
+        for st, et, tit, dsc in full_list:
+            pr_el = _ET.SubElement(
+                base_root, "programme", {"start": st, "stop": et, "channel": cid}
+            )
+            t_el = _ET.SubElement(pr_el, "title", {"lang": "zh"})
+            t_el.text = tit
+            if dsc:
+                d_el = _ET.SubElement(pr_el, "desc", {"lang": "zh"})
+                d_el.text = dsc
+
+    xml_bytes = _ET.tostring(base_root, encoding="utf-8", xml_declaration=True)
+    epg_file.write_bytes(xml_bytes)
+    with _gzip.open(str(epg_gz), "wb", compresslevel=6) as gz_out:
+        gz_out.write(xml_bytes)
+
+    return len(matched_cids_all), fetched_progs
+
+
+async def sync_remote_epg(url_str: str) -> dict:
+    """Download remote XMLTV (.xml / .xml.gz) across domestic & international feeds into local data/epg.xml(.gz)."""
+    global _epg_source_url, _epg_last_sync, _epg_cache_mtime, _epg_checked_date, _epg_sync_lock
+    import datetime as _dt
+
+    if _epg_sync_lock is None:
+        _epg_sync_lock = asyncio.Lock()
 
     clean_urls = [u.strip() for u in (url_str or "").split(",") if u.strip()]
     if not clean_urls:
         raise HTTPException(status_code=400, detail="EPG 地址不能为空")
 
-    _epg_source_url = ",".join(clean_urls)
-    save_settings_from_sidecar(get_sidecar())
+    async with _epg_sync_lock:
+        _epg_source_url = ",".join(clean_urls)
+        save_settings_from_sidecar(get_sidecar())
 
-    xml_urls = [u for u in clean_urls if "{name}" not in u and "?ch=" not in u]
-    diyp_urls = [u for u in clean_urls if u not in xml_urls]
+        xml_urls = [u for u in clean_urls if "{name}" not in u and "?ch=" not in u]
+        diyp_urls = [u for u in clean_urls if u not in xml_urls]
 
-    fetched_channels = 0
-    fetched_progs = 0
-    errors: list[str] = []
+        fetched_channels = 0
+        fetched_progs = 0
+        errors: list[str] = []
 
-    if xml_urls:
-        epg_file = DATA_DIR / "epg.xml"
-        epg_gz = DATA_DIR / "epg.xml.gz"
-        base_root = _ET.Element("tv", {"generator-info-name": "SubCast-EPG-Aggregator"})
-        seen_channels: dict[str, _ET.Element] = {}
-        progs_by_ch: dict[str, list[_ET.Element]] = {}
+        if xml_urls:
+            epg_file = DATA_DIR / "epg.xml"
+            epg_gz = DATA_DIR / "epg.xml.gz"
+            raw_payloads: list[tuple[str, bytes]] = []
+            stream_proxy = get_sidecar().stream_proxy or None
 
-        # Load existing local EPG first so channels not in remote source keep their schedules
-        if epg_file.exists():
-            try:
-                old_root = _ET.parse(str(epg_file)).getroot()
-                for ch_el in old_root.findall("channel"):
-                    cid = (ch_el.get("id") or "").strip()
-                    if cid:
-                        seen_channels[cid] = ch_el
-                for pr_el in old_root.findall("programme"):
-                    cid = (pr_el.get("channel") or "").strip()
-                    if cid:
-                        progs_by_ch.setdefault(cid, []).append(pr_el)
-            except Exception:
-                pass
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=35.0,
+                verify=False,
+                proxy=stream_proxy,
+                headers={"User-Agent": "Mozilla/5.0 SubCast/2.4"},
+            ) as client:
+                for u in xml_urls:
+                    try:
+                        resp = await client.get(u)
+                        resp.raise_for_status()
+                        raw_payloads.append((u, resp.content))
+                    except Exception as exc:
+                        errors.append(f"{u}: {exc}")
 
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=35.0,
-            verify=False,
-            headers={"User-Agent": "Mozilla/5.0 SubCast/2.4"},
-        ) as client:
-            for u in xml_urls:
-                try:
-                    resp = await client.get(u)
-                    resp.raise_for_status()
-                    raw_bytes = resp.content
-                    if raw_bytes[:2] == b"\x1f\x8b" or u.lower().split("?")[0].endswith(".gz"):
-                        raw_bytes = _gzip.decompress(raw_bytes)
-                    xml_str = raw_bytes.decode("utf-8", errors="ignore")
-                    if "epg.pw" in u.lower() and any(tag in u.upper() for tag in ("_CN", "_HK", "_TW", "_SG")):
-                        xml_str = xml_str.replace(" +0000", " +0800")
-                    remote_root = _ET.fromstring(xml_str)
-                    remote_ch_ids: set[str] = set()
-                    for ch_el in remote_root.findall("channel"):
-                        cid = (ch_el.get("id") or "").strip()
-                        if cid:
-                            seen_channels[cid] = ch_el
-                            remote_ch_ids.add(cid)
-                    # Replace programmes for channels updated by this remote source
-                    for cid in remote_ch_ids:
-                        progs_by_ch[cid] = []
-                    for pr_el in remote_root.findall("programme"):
-                        cid = (pr_el.get("channel") or "").strip()
-                        if cid:
-                            progs_by_ch.setdefault(cid, []).append(pr_el)
-                            fetched_progs += 1
-                    fetched_channels += len(remote_ch_ids)
-                except Exception as exc:
-                    errors.append(f"{u}: {exc}")
+            if raw_payloads:
+                if not _channels:
+                    load_channels_from_disk()
+                fetched_channels, fetched_progs = await asyncio.to_thread(
+                    _parse_and_merge_xmltv_bytes,
+                    raw_payloads,
+                    epg_file,
+                    epg_gz,
+                    list(_channels),
+                )
+                _epg_cache_mtime = 0.0
+                _epg_checked_date = ""
+                _ensure_epg_cache()
 
-        if fetched_channels > 0 or fetched_progs > 0:
-            cutoff_date = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y%m%d")
-            for cid in sorted(seen_channels.keys()):
-                base_root.append(seen_channels[cid])
-            for cid in sorted(progs_by_ch.keys()):
-                st_map = {
-                    (pr_el.get("start") or "").strip(): pr_el
-                    for pr_el in progs_by_ch[cid]
-                    if len((pr_el.get("start") or "").strip()) >= 8
-                }
-                if not st_map:
-                    continue
-                filtered = [pr_el for st, pr_el in sorted(st_map.items()) if st[:8] >= cutoff_date]
-                if not filtered:
-                    max_d = max(st[:8] for st in st_map.keys())
-                    filtered = [pr_el for st, pr_el in sorted(st_map.items()) if st[:8] == max_d]
-                for pr_el in filtered:
-                    base_root.append(pr_el)
-            xml_bytes = _ET.tostring(base_root, encoding="utf-8", xml_declaration=True)
-            epg_file.write_bytes(xml_bytes)
-            with _gzip.open(str(epg_gz), "wb", compresslevel=9) as gz_out:
-                gz_out.write(xml_bytes)
-            _epg_cache_mtime = 0.0
+        if diyp_urls and not xml_urls:
             _ensure_epg_cache()
 
-    if diyp_urls and not xml_urls:
+        if errors and fetched_channels == 0 and not diyp_urls:
+            return {
+                "ok": False,
+                "error": "; ".join(errors),
+                "epg_source_url": _epg_source_url,
+            }
+
+        utc8_now = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8)))
+        _epg_last_sync = utc8_now.strftime("%Y-%m-%d %H:%M")
         _ensure_epg_cache()
-
-    if errors and fetched_channels == 0 and not diyp_urls:
+        total_progs = sum(len(v) for v in _epg_prog_map.values())
         return {
-            "ok": False,
-            "error": "; ".join(errors),
+            "ok": True,
             "epg_source_url": _epg_source_url,
+            "channel_count": len(_epg_prog_map),
+            "matched_remote_channels": fetched_channels,
+            "programme_count": total_progs,
+            "synced_at": _epg_last_sync,
+            "warnings": errors,
         }
-
-    _epg_last_sync = _dt.datetime.now().strftime("%H:%M:%S")
-    _ensure_epg_cache()
-    total_progs = sum(len(v) for v in _epg_prog_map.values())
-    return {
-        "ok": True,
-        "epg_source_url": _epg_source_url,
-        "channel_count": len(_epg_prog_map),
-        "programme_count": total_progs,
-        "synced_at": _epg_last_sync,
-        "warnings": errors,
-    }
 
 
 @app.post("/api/epg-source")
@@ -1841,13 +2232,12 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
           <span id="epgStatusBadge" class="mono muted" style="font-size:12px;">...</span>
         </div>
         <div class="tabs" role="tablist" aria-label="知名 EPG 源预设" id="epgPresetSeg" style="justify-self:start; flex-wrap:wrap;">
-          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml" aria-selected="true" onclick="applyEpgPreset(this.dataset.epg)">聚合双源 · 推荐</button>
-          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">112114 极速源</button>
-          <button type="button" class="tab" role="tab" data-epg="https://live.fanmingming.com/e.xml" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">范明明 Fanmingming</button>
-          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz,https://epg.pw/xmltv/epg_HK.xml.gz,https://epg.pw/xmltv/epg_TW.xml.gz,https://epg.pw/xmltv/epg_GB.xml.gz" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">epg.pw 港澳台+国际</button>
+          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz,https://epg.pw/xmltv/epg_HK.xml.gz,https://epg.pw/xmltv/epg_TW.xml.gz,https://epg.pw/xmltv/epg_SG.xml.gz,https://epg.pw/xmltv/epg_GB.xml.gz,https://epg.pw/xmltv/epg_CA.xml.gz,https://epg.pw/xmltv/epg_DE.xml.gz,https://epg.pw/xmltv/epg_FR.xml.gz,https://epg.pw/xmltv/epg_JP.xml.gz,https://epg.pw/xmltv/epg_AU.xml.gz,https://epg.pw/xmltv/epg_US.xml.gz" aria-selected="true" onclick="applyEpgPreset(this.dataset.epg)">全球+国内全量源 · 推荐</button>
+          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz,https://epg.pw/xmltv/epg_HK.xml.gz,https://epg.pw/xmltv/epg_TW.xml.gz,https://epg.pw/xmltv/epg_SG.xml.gz,https://epg.pw/xmltv/epg_GB.xml.gz,https://epg.pw/xmltv/epg_CA.xml.gz" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">国内+欧美港澳精简</button>
+          <button type="button" class="tab" role="tab" data-epg="https://epg.112114.xyz/pp.xml.gz" aria-selected="false" onclick="applyEpgPreset(this.dataset.epg)">仅国内 112114</button>
         </div>
         <div style="display:flex; gap:8px;">
-          <input type="text" id="epgSourceInput" class="mono" style="flex:1; height:var(--btn-h-sm); padding:0 10px; border:1px solid var(--line-strong); border-radius:var(--r-sm); background:var(--bg); font-size:12.5px;" placeholder="https://epg.112114.xyz/pp.xml.gz,https://live.fanmingming.com/e.xml" oninput="syncEpgPresetHighlight()">
+          <input type="text" id="epgSourceInput" class="mono" style="flex:1; height:var(--btn-h-sm); padding:0 10px; border:1px solid var(--line-strong); border-radius:var(--r-sm); background:var(--bg); font-size:12.5px;" placeholder="https://epg.112114.xyz/pp.xml.gz,https://epg.pw/xmltv/epg_GB.xml.gz,..." oninput="syncEpgPresetHighlight()">
           <button type="button" class="btn btn--secondary btn--sm" id="btnSyncEpg" onclick="saveAndSyncEpg()">保存并同步 EPG</button>
         </div>
       </div>

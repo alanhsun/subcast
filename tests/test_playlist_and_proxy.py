@@ -286,3 +286,46 @@ def test_channel_switch_cancels_delayed_subtitles_and_switches_sources() -> None
                 sidecar._watchdog_task.cancel()
 
     asyncio.run(_run_epoch_test())
+
+
+def test_foreign_channels_epg_coverage_and_utc8_conversion() -> None:
+    from server.main import _to_utc8_xmltv_ts
+
+    # 1. Verify genuine timezone arithmetic to Beijing Time (+0800)
+    assert _to_utc8_xmltv_ts("20261112010000 +0000") == "20261112090000 +0800"
+    assert _to_utc8_xmltv_ts("20261111200000 -0500") == "20261112090000 +0800"
+    assert _to_utc8_xmltv_ts("20261112100000 +0900") == "20261112090000 +0800"
+    assert _to_utc8_xmltv_ts("20261112090000 +0800") == "20261112090000 +0800"
+
+    # 2. Verify default M3U header has a single clean x-tvg-url (no comma) and canonical tvg-name
+    sample_m3u = """#EXTM3U
+#EXTINF:-1 tvg-id="CNN国际新闻" tvg-name="CNN International" group-title="国际/海外",CNN国际新闻 (源1)
+http://1.2.3.4/cnn1.m3u8
+"""
+    parsed = parse_playlist(sample_m3u)
+    assert parsed[0].tvg_name == "CNN International"
+    exported = export_m3u(parsed, "http://10.10.10.80:8765")
+    first_line = exported.splitlines()[0]
+    assert 'x-tvg-url="http://10.10.10.80:8765/epg.xml.gz"' in first_line
+    assert "," not in first_line
+    assert 'tvg-id="CNN国际新闻" tvg-name="CNN国际新闻"' in exported
+
+    # 3. Verify DIYP EPG & XMLTV compatibility routes cover foreign channels (including multi-source & English aliases)
+    with TestClient(app) as client:
+        r_compat = client.get("/epg.xml.gz,http://10.10.10.80:8765/epg.xml")
+        assert r_compat.status_code == 200
+        assert len(r_compat.content) > 1000
+
+        for query_ch in [
+            "BBC News英国广播公司",
+            "CNN国际新闻",
+            "CNN International",
+            "Al Jazeera English半岛电视台(英语)",
+            "LiveNOW from FOX福克斯现场 (源1)",
+            "NHK World-Japan日本国际台(英语)",
+            "翡翠台",
+        ]:
+            r_epg = client.get("/epg", params={"ch": query_ch})
+            assert r_epg.status_code == 200
+            payload = r_epg.json()
+            assert len(payload["epg_data"]) > 0, f"Missing EPG for foreign channel: {query_ch}"

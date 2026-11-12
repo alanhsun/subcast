@@ -12,6 +12,8 @@ models/
 # Private runtime settings (contains LLM API Key — never commit to GitHub!)
 data/settings.json
 data/epg.xml
+data/.seed_*
+data/*.bak
 data/playlist.m3u
 data/playlist.txt
 
