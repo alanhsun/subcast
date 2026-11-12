@@ -121,3 +121,42 @@ def test_qwen3_unified_multilingual_asr() -> None:
     print(f"[Qwen3-ASR-0.6B Output] ({pipeline._pending_last_asr_ms:.0f}ms): {recognized}")
 
 
+def test_concurrent_reset_and_long_segment_safety() -> None:
+    import threading
+
+    pipeline = StreamingSpeechPipeline()
+    with wave.open(str(TEST_WAV), "rb") as wf:
+        samples = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+
+    # 1. Test 16-second overly long audio array cap in _recognize_sensevoice
+    long_samples = np.tile(samples, 4)[: 16000 * 16]
+    res = pipeline._recognize_sensevoice(long_samples)
+    assert isinstance(res, str) and len(res) > 5
+
+    # 2. Test concurrent feed_samples + reset_stream across threads (previously caused C++ SIGSEGV)
+    errors: list[Exception] = []
+
+    def feeder() -> None:
+        try:
+            for _ in range(6):
+                pipeline.feed_samples(samples[:16000])
+        except Exception as e:
+            errors.append(e)
+
+    def resetter() -> None:
+        try:
+            for i in range(6):
+                pipeline.reset_stream(channel_name=f"Channel-{i}")
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=feeder)
+    t2 = threading.Thread(target=resetter)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+    assert not errors, f"Concurrent ASR/VAD access raised errors: {errors}"
+
+
+

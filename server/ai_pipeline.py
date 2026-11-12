@@ -13,6 +13,7 @@ from __future__ import annotations
 import collections
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,31 +71,33 @@ class LocalTranslator:
             intra_threads=num_threads,
         )
         self._cache: dict[str, str] = {}
+        self._lock = threading.RLock()
 
     def translate(self, text: str) -> str:
         clean = text.strip()
         if not clean:
             return ""
-        if clean in self._cache:
-            return self._cache[clean]
+        with self._lock:
+            if clean in self._cache:
+                return self._cache[clean]
 
-        tokens = self.sp.encode(clean, out_type=str)
-        if not tokens:
-            return ""
+            tokens = self.sp.encode(clean, out_type=str)
+            if not tokens:
+                return ""
 
-        results = self.translator.translate_batch(
-            [tokens],
-            beam_size=2,
-            max_decoding_length=128,
-            repetition_penalty=1.15,
-        )
-        out_tokens = results[0].hypotheses[0]
-        zh_text = self.sp.decode(out_tokens).replace("▁", " ").strip()
+            results = self.translator.translate_batch(
+                [tokens],
+                beam_size=2,
+                max_decoding_length=128,
+                repetition_penalty=1.15,
+            )
+            out_tokens = results[0].hypotheses[0]
+            zh_text = self.sp.decode(out_tokens).replace("▁", " ").strip()
 
-        if len(self._cache) > 512:
-            self._cache.clear()
-        self._cache[clean] = zh_text
-        return zh_text
+            if len(self._cache) > 512:
+                self._cache.clear()
+            self._cache[clean] = zh_text
+            return zh_text
 
 
 class LLMContextTranslator:
@@ -122,9 +125,11 @@ class LLMContextTranslator:
         # Persistent connection pool for minimal TLS handshake overhead
         self._http = httpx.Client(timeout=6.5, verify=False)
         self._cache: dict[str, str] = {}
+        self._lock = threading.RLock()
 
     def clear_context(self) -> None:
-        self.context_window.clear()
+        with self._lock:
+            self.context_window.clear()
 
     def update_config(
         self,
@@ -134,17 +139,18 @@ class LLMContextTranslator:
         model: Optional[str] = None,
         source_lang: Optional[str] = None,
     ) -> None:
-        if enabled is not None:
-            self.config.enabled = enabled
-        if base_url is not None and base_url.strip():
-            self.config.base_url = base_url.strip().rstrip("/")
-        if api_key is not None:
-            self.config.api_key = api_key.strip()
-        if model is not None and model.strip():
-            self.config.model = model.strip()
-        if source_lang is not None and source_lang.strip():
-            self.config.source_lang = source_lang.strip()
-        self._cache.clear()
+        with self._lock:
+            if enabled is not None:
+                self.config.enabled = enabled
+            if base_url is not None and base_url.strip():
+                self.config.base_url = base_url.strip().rstrip("/")
+            if api_key is not None:
+                self.config.api_key = api_key.strip()
+            if model is not None and model.strip():
+                self.config.model = model.strip()
+            if source_lang is not None and source_lang.strip():
+                self.config.source_lang = source_lang.strip()
+            self._cache.clear()
 
     @property
     def is_llm_ready(self) -> bool:
@@ -176,19 +182,21 @@ class LLMContextTranslator:
             return self.fallback.translate(clean)
 
         # For interim previews, check cache first
-        if clean in self._cache:
-            return self._cache[clean]
+        with self._lock:
+            if clean in self._cache:
+                return self._cache[clean]
 
         try:
             zh_text = self._call_llm_api(clean, channel_name)
             if zh_text:
-                self.last_error = ""
-                self.last_used_engine = f"LLM ({self.config.model})"
-                if len(self._cache) > 256:
-                    self._cache.clear()
-                self._cache[clean] = zh_text
-                if is_final:
-                    self.context_window.append((clean, zh_text))
+                with self._lock:
+                    self.last_error = ""
+                    self.last_used_engine = f"LLM ({self.config.model})"
+                    if len(self._cache) > 256:
+                        self._cache.clear()
+                    self._cache[clean] = zh_text
+                    if is_final:
+                        self.context_window.append((clean, zh_text))
                 return zh_text
         except Exception as exc:
             self.last_error = str(exc)
@@ -198,12 +206,17 @@ class LLMContextTranslator:
         return self.fallback.translate(clean)
 
     def _call_llm_api(self, source_text: str, channel_name: str) -> str:
-        base = self.config.base_url.rstrip("/")
+        with self._lock:
+            base = self.config.base_url.rstrip("/")
+            api_key = self.config.api_key
+            model_name = self.config.model
+            context_snapshot = list(self.context_window)
+
         is_minimax = any(d in base.lower() for d in ("minimaxi.com", "minimax.io", "minimax.chat"))
         is_anthropic = "/anthropic" in base.lower()
 
         context_lines = []
-        for prev_src, prev_zh in self.context_window:
+        for prev_src, prev_zh in context_snapshot:
             context_lines.append(f"- 原文：{prev_src}\n  译文：{prev_zh}")
         context_block = "\n".join(context_lines) if context_lines else "（无前文）"
 
@@ -218,13 +231,13 @@ class LLMContextTranslator:
                 f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
             )
             headers = {
-                "Authorization": f"Bearer {self.config.api_key}",
-                "x-api-key": self.config.api_key,
+                "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json",
             }
             payload = {
-                "model": self.config.model,
+                "model": model_name,
                 "max_tokens": 1024,
                 "temperature": 0.2,
                 "system": self.SYSTEM_PROMPT,
@@ -243,11 +256,11 @@ class LLMContextTranslator:
         else:
             url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
             headers = {
-                "Authorization": f"Bearer {self.config.api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             }
             payload = {
-                "model": self.config.model,
+                "model": model_name,
                 "messages": [
                     {"role": "system", "content": self.SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
@@ -259,7 +272,7 @@ class LLMContextTranslator:
             if is_minimax:
                 # Separate MiniMax M-series reasoning into reasoning_details so content is pure translation
                 payload["reasoning_split"] = True
-                if "m3" in self.config.model.lower():
+                if "m3" in model_name.lower():
                     payload["reasoning_effort"] = "low"
 
             resp = self._http.post(url, headers=headers, json=payload)
@@ -454,6 +467,7 @@ class StreamingSpeechPipeline:
         self._samples_since_vad_pop: int = 0
         self._last_interim_emit_ts = 0.0
         self._last_interim_en = ""
+        self._asr_lock = threading.RLock()
         self.reset_stream()
 
     def _init_qwen3_asr(self) -> None:
@@ -500,29 +514,31 @@ class StreamingSpeechPipeline:
         self.vad = sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=60)
 
     def reset_stream(self, channel_name: Optional[str] = None) -> None:
-        if channel_name:
-            if channel_name != self.channel_name:
-                self.llm_translator.clear_context()
-            self.channel_name = channel_name
-        if self.vad is not None:
-            self.vad.reset()
-        self._vad_remainder = np.zeros(0, dtype=np.float32)
-        self._speech_accum = np.zeros(0, dtype=np.float32)
-        self._rolling_rms = 0.04
-        self._pending_clauses = []
-        self._pending_first_ts = 0.0
-        self._pending_wait_samples = 0
-        self._pending_last_asr_ms = 480.0
-        self._samples_since_vad_pop = 0
-        self._last_interim_emit_ts = 0.0
-        self._last_interim_en = ""
-        self.stream = self.zipformer_recognizer.create_stream() if self.zipformer_recognizer else None
+        with self._asr_lock:
+            if channel_name:
+                if channel_name != self.channel_name:
+                    self.llm_translator.clear_context()
+                self.channel_name = channel_name
+            if self.vad is not None:
+                self.vad.reset()
+            self._vad_remainder = np.zeros(0, dtype=np.float32)
+            self._speech_accum = np.zeros(0, dtype=np.float32)
+            self._rolling_rms = 0.04
+            self._pending_clauses = []
+            self._pending_first_ts = 0.0
+            self._pending_wait_samples = 0
+            self._pending_last_asr_ms = 480.0
+            self._samples_since_vad_pop = 0
+            self._last_interim_emit_ts = 0.0
+            self._last_interim_en = ""
+            self.stream = self.zipformer_recognizer.create_stream() if self.zipformer_recognizer else None
 
     def punctuate(self, raw_text: str, ensure_end_punct: bool = False) -> str:
         clean = " ".join(raw_text.strip().lower().split())
         if not clean:
             return ""
-        res = self.punctuator.add_punctuation_with_case(clean).strip()
+        with self._asr_lock:
+            res = self.punctuator.add_punctuation_with_case(clean).strip()
         if ensure_end_punct and res and res[-1] not in ".?!":
             res += "."
         return res
@@ -531,28 +547,43 @@ class StreamingSpeechPipeline:
         if len(samples) < 2400:
             return ""
 
-        t0 = time.perf_counter()
-        if self.qwen3_recognizer is not None:
-            stream = self.qwen3_recognizer.create_stream()
-            stream.accept_waveform(sample_rate, samples)
-            self.qwen3_recognizer.decode_stream(stream)
-            raw = stream.result.text.strip()
-            self._pending_last_asr_ms = (time.perf_counter() - t0) * 1000.0
-            self.last_asr_engine = "Qwen3-ASR-0.6B"
-            return raw
+        # Guard C++ ONNX Runtime against unbounded segment lengths (>7.0s) and non-contiguous arrays
+        max_samples = sample_rate * 7
+        if len(samples) > max_samples:
+            samples = samples[-max_samples:]
+        samples = np.ascontiguousarray(samples, dtype=np.float32)
 
-        if self.sensevoice_recognizer is None:
-            return ""
+        with self._asr_lock:
+            t0 = time.perf_counter()
+            if self.qwen3_recognizer is not None:
+                try:
+                    stream = self.qwen3_recognizer.create_stream()
+                    stream.accept_waveform(sample_rate, samples)
+                    self.qwen3_recognizer.decode_stream(stream)
+                    raw = stream.result.text.strip()
+                    self._pending_last_asr_ms = (time.perf_counter() - t0) * 1000.0
+                    self.last_asr_engine = "Qwen3-ASR-0.6B"
+                    return raw
+                except Exception as exc:
+                    print(f"[AIPipeline] Qwen3-ASR decode error: {exc}")
+                    return ""
 
-        stream = self.sensevoice_recognizer.create_stream()
-        stream.accept_waveform(sample_rate, samples)
-        self.sensevoice_recognizer.decode_stream(stream)
-        raw = stream.result.text.strip()
-        self._pending_last_asr_ms = (time.perf_counter() - t0) * 1000.0
-        cleaned = self._SENSEVOICE_TAG_RE.sub("", raw).strip()
-        cleaned = re.sub(r"\.\s+([a-z])", r", \1", cleaned)
-        self.last_asr_engine = "SenseVoice"
-        return cleaned
+            if self.sensevoice_recognizer is None:
+                return ""
+
+            try:
+                stream = self.sensevoice_recognizer.create_stream()
+                stream.accept_waveform(sample_rate, samples)
+                self.sensevoice_recognizer.decode_stream(stream)
+                raw = stream.result.text.strip()
+                self._pending_last_asr_ms = (time.perf_counter() - t0) * 1000.0
+                cleaned = self._SENSEVOICE_TAG_RE.sub("", raw).strip()
+                cleaned = re.sub(r"\.\s+([a-z])", r", \1", cleaned)
+                self.last_asr_engine = "SenseVoice"
+                return cleaned
+            except Exception as exc:
+                print(f"[AIPipeline] SenseVoice decode error: {exc}")
+                return ""
 
     @classmethod
     def _ends_with_dangling_word(cls, text: str) -> bool:
@@ -775,119 +806,122 @@ class StreamingSpeechPipeline:
         return self.feed_samples(samples)
 
     def feed_samples(self, samples: np.ndarray, sample_rate: int = 16000) -> List[SubtitleEvent]:
-        if not self.use_sensevoice or self.vad is None:
-            return self._feed_samples_zipformer(samples, sample_rate)
+        with self._asr_lock:
+            if not self.use_sensevoice or self.vad is None:
+                return self._feed_samples_zipformer(samples, sample_rate)
 
-        events: List[SubtitleEvent] = []
-        buf = np.concatenate([self._vad_remainder, samples])
-        window_size = 512
-        idx = 0
-        now = time.time()
-
-        while idx + window_size <= len(buf):
-            win = buf[idx : idx + window_size]
-            idx += window_size
-            win_rms = float(np.sqrt(np.mean(win * win)))
-            self._rolling_rms = 0.92 * self._rolling_rms + 0.08 * max(0.005, win_rms)
-
-            self.vad.accept_waveform(win)
-            speaking_now = self.vad.is_speech_detected()
-
-            if self._pending_clauses:
-                self._pending_wait_samples += window_size
-
-            if speaking_now:
-                self._samples_since_vad_pop = 0
-                self._speech_accum = np.concatenate([self._speech_accum, win])
-                accum_sec = len(self._speech_accum) / float(sample_rate)
-                # Prevent Silero-VAD "0 pops" deadlock on continuous TV speech/music:
-                # Force segment cut at natural energy dip after 3.2s, or hard cut at 4.8s
-                if (
-                    accum_sec >= 3.2 and win_rms < max(0.015, self._rolling_rms * 0.45)
-                ) or accum_sec >= 4.8:
-                    self.vad.flush()
-                    self._speech_accum = np.zeros(0, dtype=np.float32)
-                    speaking_now = False
-            elif self._pending_clauses:
-                self._samples_since_vad_pop += window_size
-
-            # 1. Check if Silero-VAD completed one or more speech segments
-            while not self.vad.empty():
-                seg_samples = np.array(self.vad.front.samples, dtype=np.float32)
-                self.vad.pop()
-                self._speech_accum = np.zeros(0, dtype=np.float32)
-                self._last_interim_en = ""
-                self._samples_since_vad_pop = 0
-
-                if len(seg_samples) < int(16000 * 0.35):
-                    continue
-
-                src_text = self._recognize_sensevoice(seg_samples)
-                if not src_text or len(src_text.strip(" .,?!。，？！")) < 2:
-                    continue
-
-                self._append_clause_to_pending(src_text, now)
-                if self._should_flush_pending(
-                    now=now,
-                    is_currently_speaking=self.vad.is_speech_detected(),
-                    post_vad_silence_sec=0.0,
-                ):
-                    ev = self._flush_pending_to_event()
-                    if ev is not None:
-                        events.append(ev)
-
-            # 2. Check if buffered clauses should flush (by silence timeout OR max_wait_sec during continuous speech)
-            if self._pending_clauses:
-                post_silence_sec = (
-                    0.0 if speaking_now else (self._samples_since_vad_pop / float(sample_rate))
-                )
-                if self._should_flush_pending(
-                    now=now,
-                    is_currently_speaking=speaking_now,
-                    post_vad_silence_sec=post_silence_sec,
-                ):
-                    ev = self._flush_pending_to_event()
-                    if ev is not None:
-                        events.append(ev)
-
-        self._vad_remainder = buf[idx:]
-        return events
-
-    def flush(self) -> List[SubtitleEvent]:
-        events: List[SubtitleEvent] = []
-        if self.use_sensevoice and self.vad is not None:
-            # Feed 0.8s of silence to flush VAD
-            silence = np.zeros(int(16000 * 0.8), dtype=np.float32)
-            events.extend(self.feed_samples(silence))
-            self.vad.flush()
+            events: List[SubtitleEvent] = []
+            buf = np.concatenate([self._vad_remainder, samples])
+            window_size = 512
+            idx = 0
             now = time.time()
-            while not self.vad.empty():
-                seg_samples = np.array(self.vad.front.samples, dtype=np.float32)
-                self.vad.pop()
-                src_text = self._recognize_sensevoice(seg_samples)
-                if src_text and len(src_text.strip(" .,?!。，？！")) >= 2:
+
+            while idx + window_size <= len(buf):
+                win = buf[idx : idx + window_size]
+                idx += window_size
+                win_rms = float(np.sqrt(np.mean(win * win)))
+                self._rolling_rms = 0.92 * self._rolling_rms + 0.08 * max(0.005, win_rms)
+
+                self.vad.accept_waveform(win)
+                speaking_now = self.vad.is_speech_detected()
+
+                if self._pending_clauses:
+                    self._pending_wait_samples += window_size
+
+                if speaking_now:
+                    self._samples_since_vad_pop = 0
+                    self._speech_accum = np.concatenate([self._speech_accum, win])
+                    accum_sec = len(self._speech_accum) / float(sample_rate)
+                    # Prevent Silero-VAD "0 pops" deadlock on continuous TV speech/music:
+                    # Force segment cut at natural energy dip after 3.2s, or hard cut at 4.8s
+                    if (
+                        accum_sec >= 3.2 and win_rms < max(0.015, self._rolling_rms * 0.45)
+                    ) or accum_sec >= 4.8:
+                        self.vad.flush()
+                        self._speech_accum = np.zeros(0, dtype=np.float32)
+                        speaking_now = False
+                elif self._pending_clauses:
+                    self._samples_since_vad_pop += window_size
+
+                # 1. Check if Silero-VAD completed one or more speech segments
+                while not self.vad.empty():
+                    seg_samples = np.array(self.vad.front.samples, dtype=np.float32)
+                    self.vad.pop()
+                    self._speech_accum = np.zeros(0, dtype=np.float32)
+                    self._last_interim_en = ""
+                    self._samples_since_vad_pop = 0
+
+                    if len(seg_samples) < int(16000 * 0.35):
+                        continue
+
+                    src_text = self._recognize_sensevoice(seg_samples)
+                    if not src_text or len(src_text.strip(" .,?!。，？！")) < 2:
+                        continue
+
                     self._append_clause_to_pending(src_text, now)
-            if self._pending_clauses:
-                ev = self._flush_pending_to_event()
-                if ev is not None:
-                    events.append(ev)
-            self.reset_stream()
+                    if self._should_flush_pending(
+                        now=now,
+                        is_currently_speaking=self.vad.is_speech_detected(),
+                        post_vad_silence_sec=0.0,
+                    ):
+                        ev = self._flush_pending_to_event()
+                        if ev is not None:
+                            events.append(ev)
+
+                # 2. Check if buffered clauses should flush (by silence timeout OR max_wait_sec during continuous speech)
+                if self._pending_clauses:
+                    post_silence_sec = (
+                        0.0 if speaking_now else (self._samples_since_vad_pop / float(sample_rate))
+                    )
+                    if self._should_flush_pending(
+                        now=now,
+                        is_currently_speaking=speaking_now,
+                        post_vad_silence_sec=post_silence_sec,
+                    ):
+                        ev = self._flush_pending_to_event()
+                        if ev is not None:
+                            events.append(ev)
+
+            self._vad_remainder = buf[idx:]
             return events
 
-        return events
+    def flush(self) -> List[SubtitleEvent]:
+        with self._asr_lock:
+            events: List[SubtitleEvent] = []
+            if self.use_sensevoice and self.vad is not None:
+                # Feed 0.8s of silence to flush VAD
+                silence = np.zeros(int(16000 * 0.8), dtype=np.float32)
+                events.extend(self.feed_samples(silence))
+                self.vad.flush()
+                now = time.time()
+                while not self.vad.empty():
+                    seg_samples = np.array(self.vad.front.samples, dtype=np.float32)
+                    self.vad.pop()
+                    src_text = self._recognize_sensevoice(seg_samples)
+                    if src_text and len(src_text.strip(" .,?!。，？！")) >= 2:
+                        self._append_clause_to_pending(src_text, now)
+                if self._pending_clauses:
+                    ev = self._flush_pending_to_event()
+                    if ev is not None:
+                        events.append(ev)
+                self.reset_stream()
+                return events
+
+            return events
 
     def _feed_samples_zipformer(
         self, samples: np.ndarray, sample_rate: int = 16000
     ) -> List[SubtitleEvent]:
-        events: List[SubtitleEvent] = []
-        self.stream.accept_waveform(sample_rate, samples)
-        while self.zipformer_recognizer.is_ready(self.stream):
-            self.zipformer_recognizer.decode_stream(self.stream)
-        raw_result = self.zipformer_recognizer.get_result(self.stream).strip()
-        is_endpoint = self.zipformer_recognizer.is_endpoint(self.stream)
-        if is_endpoint and raw_result:
-            ev = self.process_text_direct(raw_result, is_final=True)
-            if ev:
-                events.append(ev)
-            self.zipformer_recognizer.reset(self.stream)
-        return events
+        with self._asr_lock:
+            events: List[SubtitleEvent] = []
+            self.stream.accept_waveform(sample_rate, samples)
+            while self.zipformer_recognizer.is_ready(self.stream):
+                self.zipformer_recognizer.decode_stream(self.stream)
+            raw_result = self.zipformer_recognizer.get_result(self.stream).strip()
+            is_endpoint = self.zipformer_recognizer.is_endpoint(self.stream)
+            if is_endpoint and raw_result:
+                ev = self.process_text_direct(raw_result, is_final=True)
+                if ev:
+                    events.append(ev)
+                self.zipformer_recognizer.reset(self.stream)
+            return events

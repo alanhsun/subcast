@@ -250,6 +250,34 @@ def extract_hls_segment_duration(manifest_text: str) -> Optional[float]:
     return target_dur
 
 
+def _terminate_ffmpeg_proc(proc: Optional[subprocess.Popen]) -> None:
+    """Safely kill an FFmpeg subprocess, close its stdout pipe, and reap it so no zombie remains."""
+    if proc is None:
+        return
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=1.5)
+    except Exception:
+        pass
+
+
+def _normalize_base_channel_name(name: str) -> str:
+    if not name:
+        return ""
+    base = name.split(" (源")[0].strip()
+    if base in ("", "Live Channel", "自定义测试流"):
+        return ""
+    return base
+
+
 class AudioSidecarManager:
     """
     Manages the single active FFmpeg audio extraction process and feeds 16kHz PCM frames
@@ -309,11 +337,14 @@ class AudioSidecarManager:
         candidate_urls: Optional[List[str]] = None,
     ) -> None:
         now = time.time()
+        old_worker: Optional[threading.Thread] = None
         with self._lock:
             self.last_touch_time = now
             if manual_pin is not None:
                 self.manual_pinned = manual_pin
 
+            norm_new = _normalize_base_channel_name(channel_name)
+            norm_cur = _normalize_base_channel_name(self.active_channel_name)
             is_same = (
                 self._worker_thread is not None
                 and self._worker_thread.is_alive()
@@ -324,6 +355,7 @@ class AudioSidecarManager:
                         and channel_id != "manual"
                         and self.active_channel_id == channel_id
                     )
+                    or (bool(norm_new) and norm_new == norm_cur)
                 )
             )
             if is_same:
@@ -335,27 +367,39 @@ class AudioSidecarManager:
                 if u and u not in dedup_candidates:
                     dedup_candidates.append(u)
 
+            old_worker = self._worker_thread
             self._stop_worker_locked()
             self.active_channel_id = channel_id
             self.active_channel_name = channel_name or "Live Channel"
             self.active_upstream_url = upstream_url
             self.active_candidate_urls = dedup_candidates
             self._last_subtitle_payload = None
-            self._stop_event.clear()
-            while not self._translate_queue.empty():
-                try:
-                    self._translate_queue.get_nowait()
-                except queue.Empty:
-                    break
+
+            # Allocate a brand-new Event and Queue per channel session so the stopping
+            # worker threads never observe a cleared _stop_event or drained poison pill.
+            session_stop = threading.Event()
+            session_queue: queue.Queue[Optional[SubtitleEvent]] = queue.Queue(maxsize=32)
+            self._stop_event = session_stop
+            self._translate_queue = session_queue
+
             self._translate_thread = threading.Thread(
                 target=self._translation_worker,
+                args=(session_stop, session_queue),
                 daemon=True,
                 name=f"LLMTrans-{channel_id}",
             )
             self._translate_thread.start()
             self._worker_thread = threading.Thread(
                 target=self._audio_tap_worker,
-                args=(channel_id, self.active_channel_name, upstream_url, dedup_candidates),
+                args=(
+                    channel_id,
+                    self.active_channel_name,
+                    upstream_url,
+                    dedup_candidates,
+                    session_stop,
+                    session_queue,
+                    old_worker,
+                ),
                 daemon=True,
                 name=f"AudioTap-{channel_id}",
             )
@@ -379,11 +423,7 @@ class AudioSidecarManager:
             pass
         proc = self._ffmpeg_proc
         self._ffmpeg_proc = None
-        if proc is not None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        _terminate_ffmpeg_proc(proc)
 
     def update_hls_manifest_metrics_from_seg_dur(self, seg_dur: float) -> None:
         """
@@ -467,19 +507,25 @@ class AudioSidecarManager:
             if keepalive_payload is not None:
                 await self.broadcast_cb(keepalive_payload)
 
-    def _translation_worker(self) -> None:
+    def _translation_worker(
+        self,
+        stop_event: Optional[threading.Event] = None,
+        translate_queue: Optional[queue.Queue[Optional[SubtitleEvent]]] = None,
+    ) -> None:
         """Background worker that runs LLM translations sequentially without blocking FFmpeg audio capture."""
-        while not self._stop_event.is_set():
+        ev_stop = stop_event or self._stop_event
+        ev_queue = translate_queue or self._translate_queue
+        while not ev_stop.is_set():
             try:
-                ev = self._translate_queue.get(timeout=0.5)
+                ev = ev_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if ev is None or self._stop_event.is_set():
+            if ev is None or ev_stop.is_set():
                 break
             try:
                 if not ev.zh:
                     ev = self.pipeline.complete_event_translation(ev)
-                if ev.zh and not self._stop_event.is_set():
+                if ev.zh and not ev_stop.is_set():
                     self._handle_subtitle_event(ev)
             except Exception as exc:
                 print(f"[Sidecar] Translation worker error: {exc}")
@@ -490,7 +536,17 @@ class AudioSidecarManager:
         channel_name: str,
         upstream_url: str,
         candidate_urls: Optional[List[str]] = None,
+        stop_event: Optional[threading.Event] = None,
+        translate_queue: Optional[queue.Queue[Optional[SubtitleEvent]]] = None,
+        prev_worker: Optional[threading.Thread] = None,
     ) -> None:
+        ev_stop = stop_event or self._stop_event
+        ev_queue = translate_queue or self._translate_queue
+        if prev_worker is not None and prev_worker.is_alive() and prev_worker is not threading.current_thread():
+            prev_worker.join(timeout=1.5)
+        if ev_stop.is_set():
+            return
+
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
         extra_hls_args = _get_ffmpeg_extra_args(ffmpeg_bin)
         candidates = [u for u in (candidate_urls or [upstream_url]) if u]
@@ -519,7 +575,7 @@ class AudioSidecarManager:
 
         cand_idx = 0
         try:
-            while not self._stop_event.is_set():
+            while not ev_stop.is_set():
                 raw_url = candidates[cand_idx % len(candidates)]
                 cand_idx += 1
                 is_http = raw_url.lower().startswith(("http://", "https://"))
@@ -532,7 +588,7 @@ class AudioSidecarManager:
                 is_hls = ".m3u8" in target_url.lower() or ".m3u8" in raw_url.lower()
 
                 with self._lock:
-                    if self._stop_event.is_set():
+                    if ev_stop.is_set():
                         return
                     self.active_upstream_url = target_url
 
@@ -584,6 +640,7 @@ class AudioSidecarManager:
                     ]
                 )
 
+                proc: Optional[subprocess.Popen] = None
                 try:
                     proc = subprocess.Popen(
                         cmd,
@@ -592,8 +649,8 @@ class AudioSidecarManager:
                         bufsize=6400,
                     )
                     with self._lock:
-                        if self._stop_event.is_set():
-                            proc.kill()
+                        if ev_stop.is_set():
+                            _terminate_ffmpeg_proc(proc)
                             return
                         self._ffmpeg_proc = proc
 
@@ -602,7 +659,7 @@ class AudioSidecarManager:
                     audio_fed_sec = 0.0
                     tap_start_perf = 0.0
                     assert proc.stdout is not None
-                    while not self._stop_event.is_set():
+                    while not ev_stop.is_set():
                         pcm_chunk = proc.stdout.read(chunk_size)
                         if not pcm_chunk:
                             break
@@ -612,8 +669,10 @@ class AudioSidecarManager:
 
                         events = self.pipeline.feed_pcm_s16le(pcm_chunk)
                         for ev in events:
+                            if ev_stop.is_set():
+                                break
                             try:
-                                self._translate_queue.put_nowait(ev)
+                                ev_queue.put_nowait(ev)
                             except queue.Full:
                                 pass
 
@@ -624,7 +683,7 @@ class AudioSidecarManager:
                             actual_elapsed = time.perf_counter() - tap_start_perf
                             sleep_sec = target_elapsed - actual_elapsed
                             if 0.01 < sleep_sec <= 1.5:
-                                if self._stop_event.wait(sleep_sec):
+                                if ev_stop.wait(sleep_sec):
                                     break
                             elif sleep_sec < -4.0:
                                 tap_start_perf = time.perf_counter() - target_elapsed
@@ -632,16 +691,13 @@ class AudioSidecarManager:
                     print(f"[Sidecar] Audio tap attempt error on [{channel_name}] ({target_url}): {inner_exc}")
                 finally:
                     with self._lock:
-                        if self._ffmpeg_proc is not None:
-                            try:
-                                self._ffmpeg_proc.kill()
-                            except Exception:
-                                pass
+                        if self._ffmpeg_proc is proc:
                             self._ffmpeg_proc = None
+                    _terminate_ffmpeg_proc(proc)
 
                 # If not global-stopped and this is a network stream, fail over / reconnect
-                if not self._stop_event.is_set() and is_http:
-                    if self._stop_event.wait(1.0):
+                if not ev_stop.is_set() and is_http:
+                    if ev_stop.wait(1.0):
                         break
                     print(
                         f"[Sidecar] Stream ended or stalled for [{channel_name}], "
@@ -653,13 +709,6 @@ class AudioSidecarManager:
         except Exception as exc:
             print(f"[Sidecar] Audio tap error on [{channel_name}]: {exc}")
         finally:
-            with self._lock:
-                if self._ffmpeg_proc is not None:
-                    try:
-                        self._ffmpeg_proc.kill()
-                    except Exception:
-                        pass
-                    self._ffmpeg_proc = None
             print(f"[Sidecar] Audio tap stopped for [{channel_name}].")
 
     def _handle_subtitle_event(self, ev: SubtitleEvent) -> None:
