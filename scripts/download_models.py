@@ -142,16 +142,38 @@ def download_file(url: str, dest: Path, desc: str = "") -> None:
         raise last_err
 
 
+SEED_PLAYLIST_VERSION = "2.4.3"
+
+
 def ensure_seed_data() -> None:
-    """Populate /app/data with initial playlist & EPG if mounted volume on Unraid NAS is empty."""
+    """Populate or upgrade /app/data built-in playlist & EPG on Unraid NAS volume mounts."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not SEED_DATA_DIR.exists():
         return
     seed_pl = SEED_DATA_DIR / "playlist_source.txt"
     dst_pl = DATA_DIR / "playlist_source.txt"
-    if seed_pl.exists() and not dst_pl.exists():
-        shutil.copy2(seed_pl, dst_pl)
-        print("[Init] Seeded default 337-channel IPTV playlist into data/playlist_source.txt")
+    ver_file = DATA_DIR / ".seed_playlist_version"
+    cur_ver = ver_file.read_text(encoding="utf-8").strip() if ver_file.exists() else ""
+
+    if seed_pl.exists():
+        if not dst_pl.exists():
+            shutil.copy2(seed_pl, dst_pl)
+            ver_file.write_text(SEED_PLAYLIST_VERSION, encoding="utf-8")
+            print(f"[Init] Seeded default IPTV playlist (v{SEED_PLAYLIST_VERSION}) into data/playlist_source.txt")
+        elif cur_ver != SEED_PLAYLIST_VERSION:
+            existing_txt = dst_pl.read_text(encoding="utf-8", errors="ignore")
+            # Auto-upgrade if data/playlist_source.txt is an older built-in SubCast M3U seed
+            if existing_txt.lstrip().startswith("#EXTM3U") and "CCTV1" in existing_txt and "BBC" in existing_txt:
+                bak_pl = DATA_DIR / "playlist_source.txt.bak"
+                shutil.copy2(dst_pl, bak_pl)
+                shutil.copy2(seed_pl, dst_pl)
+                ver_file.write_text(SEED_PLAYLIST_VERSION, encoding="utf-8")
+                print(
+                    f"[Init] Upgraded built-in IPTV playlist to v{SEED_PLAYLIST_VERSION} "
+                    f"(previous backed up to data/playlist_source.txt.bak)"
+                )
+            else:
+                ver_file.write_text(SEED_PLAYLIST_VERSION, encoding="utf-8")
 
     seed_epg_gz = SEED_DATA_DIR / "epg.xml.gz"
     dst_epg_gz = DATA_DIR / "epg.xml.gz"

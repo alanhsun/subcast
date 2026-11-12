@@ -159,4 +159,23 @@ def test_concurrent_reset_and_long_segment_safety() -> None:
     assert not errors, f"Concurrent ASR/VAD access raised errors: {errors}"
 
 
+def test_filler_hallucination_filter_and_jitter_safe_dangling_wait() -> None:
+    pipeline = StreamingSpeechPipeline()
+    pipeline.reset_stream(channel_name="LiveNOW from FOX")
+
+    # 1. Commercial music short CJK filler hallucinations ("啊，有。", "嗯。") must be dropped
+    pipeline._append_clause_to_pending("啊，有。", 100.0)
+    assert pipeline._flush_pending_to_event() is None
+    pipeline._append_clause_to_pending("嗯。", 102.0)
+    assert pipeline._flush_pending_to_event() is None
+
+    # 2. Network wall-clock jitter (6.0s wall time, only 1.0s audio samples) must NOT prematurely
+    # flush a mid-sentence dangling clause ("monitoring and") while speaking!
+    pipeline._append_clause_to_pending("In Washington today, officials are monitoring and.", 200.0)
+    pipeline._pending_wait_samples = 16000  # 1.0s of actual stream audio
+    assert not pipeline._should_flush_pending(
+        now=206.0, is_currently_speaking=True, post_vad_silence_sec=0.0
+    )
+
+
 

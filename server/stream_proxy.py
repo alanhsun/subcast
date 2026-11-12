@@ -8,6 +8,7 @@ audio in the background, runs the local AI subtitle pipeline (Silero-VAD + Qwen3
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import re
 import shutil
@@ -45,27 +46,89 @@ def _unwrap_beacon_url(url: str) -> str:
     return url
 
 
-def resolve_best_audio_stream_info(url: str, timeout: float = 5.5) -> tuple[str, Optional[float]]:
+def _discover_sibling_master_urls(base_url: str) -> List[str]:
     """
-    Resolves a Master M3U8 into its single best audio sub-playlist URL and extracts its
-    average segment duration (seconds) so FFmpeg does not:
+    Given a single-bitrate media M3U8 URL (e.g. .../master_6500000.m3u8, .../01.m3u8,
+    .../chunklist_b4500000.m3u8, or .../highw/index.m3u8), returns candidate Master M3U8 URLs
+    on the same origin/feed so FFmpeg can tap a low-bitrate or audio-only sibling track.
+    """
+    try:
+        parsed = urlparse(base_url)
+        path = parsed.path or ""
+    except Exception:
+        return []
+
+    candidates: List[str] = []
+
+    def _add(rel: str) -> None:
+        u = urljoin(base_url, rel)
+        if u != base_url and u not in candidates:
+            candidates.append(u)
+
+    if re.search(r"/(?:master|index|playlist|prog_index)_[A-Za-z0-9_-]+\.m3u8$", path, re.IGNORECASE):
+        for name in ("master.m3u8", "playlist.m3u8", "index.m3u8"):
+            _add(name)
+    elif re.search(r"/0[1-6]\.m3u8$", path, re.IGNORECASE):
+        for name in ("master.m3u8", "index.m3u8", "playlist.m3u8"):
+            _add(name)
+    elif re.search(r"/chunklist_b\d+.*\.m3u8$", path, re.IGNORECASE):
+        for name in ("playlist.m3u8", "master.m3u8"):
+            _add(name)
+
+    if re.search(
+        r"/(?:stream\d+|\w*high\w*|hd|\d{3,4}p|b?\d{6,8})/(?:index|playlist|streamPlaylist|prog_index)\.m3u8$",
+        path,
+        re.IGNORECASE,
+    ):
+        for name in ("../master.m3u8", "../playlist.m3u8", "../index.m3u8"):
+            _add(name)
+
+    return candidates[:3]
+
+
+def resolve_best_audio_stream_info(
+    url: str,
+    timeout: float = 5.5,
+    stream_proxy: str = "",
+) -> tuple[str, Optional[float]]:
+    """
+    Resolves a Master M3U8 (or single-bitrate variant with a sibling Master M3U8) into its
+    single best audio sub-playlist URL and extracts its average segment duration (seconds) so FFmpeg does not:
     1) Download all 4~8 video resolution variants simultaneously (causing 15-25s timeouts),
-    2) Miss demuxed audio tracks (#EXT-X-MEDIA:TYPE=AUDIO,URI="..."), or
-    3) Abort on dead subtitle sub-playlists (#EXT-X-MEDIA:TYPE=SUBTITLES -> 404).
+    2) Pull a 4-6 Mbps 1080p stream across slow cross-border links when a 64-480 kbps sibling exists,
+    3) Miss demuxed audio tracks (#EXT-X-MEDIA:TYPE=AUDIO,URI="..."), or
+    4) Abort on dead subtitle sub-playlists (#EXT-X-MEDIA:TYPE=SUBTITLES -> 404).
     """
     clean_url = _unwrap_beacon_url(url)
     if ".m3u8" not in clean_url.lower():
         return clean_url, None
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"}
+    client_kwargs: dict = {"follow_redirects=True": True}
+    client_opts: dict = {"follow_redirects": True, "timeout": timeout, "verify": False}
+    if stream_proxy:
+        client_opts["proxy"] = stream_proxy
+    del client_kwargs
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout, verify=False) as client:
+        with httpx.Client(**client_opts) as client:
             resp = client.get(clean_url, headers=headers)
             if resp.status_code >= 400:
                 return clean_url, None
             base_url = str(resp.url)
             text = resp.text
             if "#EXT-X-STREAM-INF" not in text and "#EXT-X-MEDIA" not in text:
-                return base_url, extract_hls_segment_duration(text)
+                for sib_url in _discover_sibling_master_urls(base_url):
+                    try:
+                        r_sib = client.get(sib_url, headers=headers, timeout=2.5)
+                        if r_sib.status_code < 400 and (
+                            "#EXT-X-STREAM-INF" in r_sib.text or "#EXT-X-MEDIA" in r_sib.text
+                        ):
+                            base_url = str(r_sib.url)
+                            text = r_sib.text
+                            break
+                    except Exception:
+                        pass
+                if "#EXT-X-STREAM-INF" not in text and "#EXT-X-MEDIA" not in text:
+                    return base_url, extract_hls_segment_duration(text)
 
             lines = [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -113,8 +176,8 @@ def resolve_best_audio_stream_info(url: str, timeout: float = 5.5) -> tuple[str,
     return clean_url, None
 
 
-def resolve_best_audio_stream_url(url: str, timeout: float = 5.5) -> str:
-    return resolve_best_audio_stream_info(url, timeout=timeout)[0]
+def resolve_best_audio_stream_url(url: str, timeout: float = 5.5, stream_proxy: str = "") -> str:
+    return resolve_best_audio_stream_info(url, timeout=timeout, stream_proxy=stream_proxy)[0]
 
 
 def _get_ffmpeg_extra_args(ffmpeg_bin: str) -> List[str]:
@@ -269,13 +332,39 @@ def _terminate_ffmpeg_proc(proc: Optional[subprocess.Popen]) -> None:
         pass
 
 
-def _normalize_base_channel_name(name: str) -> str:
-    if not name:
-        return ""
-    base = name.split(" (源")[0].strip()
-    if base in ("", "Live Channel", "自定义测试流"):
-        return ""
-    return base
+def _is_master_like_m3u8(url: str) -> bool:
+    lower = url.split("?")[0].lower()
+    if not lower.endswith(".m3u8"):
+        return False
+    if re.search(r"(?:_\d{4,}|highw|1080p?|720p?|chunklist_b\d+|/0[1-6]\.m3u8$)", lower):
+        return False
+    return any(lower.endswith(s) for s in ("/master.m3u8", "/playlist.m3u8", "/index.m3u8"))
+
+
+def _rank_audio_candidates(primary_url: str, candidates: List[str], slow_urls: set[str]) -> List[str]:
+    """
+    Orders candidate stream URLs for FFmpeg audio extraction:
+    1. Keeps the requested `primary_url` first unless it was previously flagged as too slow (<0.68x).
+    2. Prioritizes non-slow URLs and adaptive Master M3U8s (which offer low-bitrate/audio-only variants)
+       ahead of single-bitrate HD streams.
+    """
+    dedup: List[str] = []
+    for u in [primary_url] + list(candidates or []):
+        if u and u not in dedup:
+            dedup.append(u)
+    if len(dedup) <= 1:
+        return dedup
+
+    def _sort_key(idx_and_url: tuple[int, str]) -> tuple[int, int, int]:
+        idx, u = idx_and_url
+        is_slow = 1 if u in slow_urls else 0
+        if idx == 0 and not is_slow:
+            return (0, 0, 0)
+        not_master = 0 if _is_master_like_m3u8(u) else 1
+        return (is_slow, 1 + not_master, idx)
+
+    ranked = [u for _, u in sorted(enumerate(dedup), key=_sort_key)]
+    return ranked
 
 
 class AudioSidecarManager:
@@ -288,11 +377,12 @@ class AudioSidecarManager:
         self,
         pipeline: StreamingSpeechPipeline,
         broadcast_cb: Callable[[dict], Awaitable[None]],
-        idle_timeout_sec: float = 75.0,
+        idle_timeout_sec: float = 25.0,
     ) -> None:
         self.pipeline = pipeline
         self.broadcast_cb = broadcast_cb
         self.idle_timeout_sec = idle_timeout_sec
+        self.stream_proxy: str = os.environ.get("LINGUARELAY_STREAM_PROXY", "").strip()
 
         self.active_channel_id: str = ""
         self.active_channel_name: str = ""
@@ -313,6 +403,8 @@ class AudioSidecarManager:
         self._last_subtitle_payload: Optional[dict] = None
         self._last_subtitle_content_ts: float = 0.0
         self._last_broadcast_ts: float = 0.0
+        self._session_epoch: int = 0
+        self._slow_urls: set[str] = set()
 
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
         self._worker_thread: Optional[threading.Thread] = None
@@ -343,8 +435,6 @@ class AudioSidecarManager:
             if manual_pin is not None:
                 self.manual_pinned = manual_pin
 
-            norm_new = _normalize_base_channel_name(channel_name)
-            norm_cur = _normalize_base_channel_name(self.active_channel_name)
             is_same = (
                 self._worker_thread is not None
                 and self._worker_thread.is_alive()
@@ -355,23 +445,22 @@ class AudioSidecarManager:
                         and channel_id != "manual"
                         and self.active_channel_id == channel_id
                     )
-                    or (bool(norm_new) and norm_new == norm_cur)
                 )
             )
             if is_same:
                 self.active_channel_name = channel_name or self.active_channel_name
                 return
 
-            dedup_candidates: List[str] = []
-            for u in [upstream_url] + list(candidate_urls or []):
-                if u and u not in dedup_candidates:
-                    dedup_candidates.append(u)
+            dedup_candidates = _rank_audio_candidates(
+                upstream_url, list(candidate_urls or []), self._slow_urls
+            )
 
             old_worker = self._worker_thread
             self._stop_worker_locked()
+            session_epoch = self._session_epoch
             self.active_channel_id = channel_id
             self.active_channel_name = channel_name or "Live Channel"
-            self.active_upstream_url = upstream_url
+            self.active_upstream_url = dedup_candidates[0] if dedup_candidates else upstream_url
             self.active_candidate_urls = dedup_candidates
             self._last_subtitle_payload = None
 
@@ -382,9 +471,12 @@ class AudioSidecarManager:
             self._stop_event = session_stop
             self._translate_queue = session_queue
 
+            # Clear any previous channel's subtitle on the TV screen immediately
+            self._schedule_broadcast({"type": "clear"}, delay_ms=0, session_epoch=None)
+
             self._translate_thread = threading.Thread(
                 target=self._translation_worker,
-                args=(session_stop, session_queue),
+                args=(session_stop, session_queue, session_epoch),
                 daemon=True,
                 name=f"LLMTrans-{channel_id}",
             )
@@ -399,24 +491,31 @@ class AudioSidecarManager:
                     session_stop,
                     session_queue,
                     old_worker,
+                    session_epoch,
                 ),
                 daemon=True,
                 name=f"AudioTap-{channel_id}",
             )
             self._worker_thread.start()
 
-    def stop_current(self) -> None:
+    def stop_current(self) -> bool:
         with self._lock:
+            was_active = bool(self.active_channel_id) or (
+                self._worker_thread is not None and self._worker_thread.is_alive()
+            )
             self.manual_pinned = False
             self._stop_worker_locked()
             self.active_channel_id = ""
             self.active_channel_name = ""
             self.active_upstream_url = ""
             self.active_candidate_urls = []
+            return was_active
 
     def _stop_worker_locked(self) -> None:
+        self._session_epoch += 1
         self._stop_event.set()
         self._last_subtitle_payload = None
+        self._last_subtitle_content_ts = 0.0
         try:
             self._translate_queue.put_nowait(None)
         except queue.Full:
@@ -479,19 +578,11 @@ class AudioSidecarManager:
         while True:
             await asyncio.sleep(2.5)
             keepalive_payload: Optional[dict] = None
+            keepalive_epoch: int = -1
+            send_clear = False
             now = time.time()
             with self._lock:
                 is_alive = self._worker_thread is not None and self._worker_thread.is_alive()
-                if is_alive and self._last_subtitle_payload is not None:
-                    # Keep the current subtitle alive on the TV screen so it never blanks out
-                    # while the next full sentence is being spoken and translated!
-                    if (
-                        (now - self._last_broadcast_ts) >= 4.0
-                        and (now - self._last_subtitle_content_ts) <= 38.0
-                    ):
-                        keepalive_payload = dict(self._last_subtitle_payload)
-                        self._last_broadcast_ts = now
-
                 if not is_alive or self.manual_pinned:
                     pass
                 elif (now - self.last_touch_time) > self.idle_timeout_sec:
@@ -503,14 +594,34 @@ class AudioSidecarManager:
                     self.active_channel_id = ""
                     self.active_channel_name = ""
                     self.active_upstream_url = ""
+                    self.active_candidate_urls = []
+                    is_alive = False
+                    send_clear = True
 
-            if keepalive_payload is not None:
-                await self.broadcast_cb(keepalive_payload)
+                if is_alive and self._last_subtitle_payload is not None:
+                    # Keep the current subtitle alive on the TV screen so it never blanks out
+                    # while the next full sentence is being spoken and translated!
+                    if (
+                        (now - self._last_broadcast_ts) >= 4.0
+                        and (now - self._last_subtitle_content_ts) <= 38.0
+                    ):
+                        keepalive_payload = dict(self._last_subtitle_payload)
+                        keepalive_epoch = self._session_epoch
+                        self._last_broadcast_ts = now
+
+            if send_clear:
+                await self.broadcast_cb({"type": "clear"})
+            elif keepalive_payload is not None:
+                with self._lock:
+                    still_valid = self._session_epoch == keepalive_epoch
+                if still_valid:
+                    await self.broadcast_cb(keepalive_payload)
 
     def _translation_worker(
         self,
         stop_event: Optional[threading.Event] = None,
         translate_queue: Optional[queue.Queue[Optional[SubtitleEvent]]] = None,
+        session_epoch: Optional[int] = None,
     ) -> None:
         """Background worker that runs LLM translations sequentially without blocking FFmpeg audio capture."""
         ev_stop = stop_event or self._stop_event
@@ -526,7 +637,7 @@ class AudioSidecarManager:
                 if not ev.zh:
                     ev = self.pipeline.complete_event_translation(ev)
                 if ev.zh and not ev_stop.is_set():
-                    self._handle_subtitle_event(ev)
+                    self._handle_subtitle_event(ev, session_epoch=session_epoch)
             except Exception as exc:
                 print(f"[Sidecar] Translation worker error: {exc}")
 
@@ -539,6 +650,7 @@ class AudioSidecarManager:
         stop_event: Optional[threading.Event] = None,
         translate_queue: Optional[queue.Queue[Optional[SubtitleEvent]]] = None,
         prev_worker: Optional[threading.Thread] = None,
+        session_epoch: Optional[int] = None,
     ) -> None:
         ev_stop = stop_event or self._stop_event
         ev_queue = translate_queue or self._translate_queue
@@ -571,6 +683,7 @@ class AudioSidecarManager:
                 "display_mode": self.display_mode,
             },
             delay_ms=0,
+            session_epoch=session_epoch,
         )
 
         cand_idx = 0
@@ -580,7 +693,9 @@ class AudioSidecarManager:
                 cand_idx += 1
                 is_http = raw_url.lower().startswith(("http://", "https://"))
                 if is_http:
-                    target_url, detected_seg_dur = resolve_best_audio_stream_info(raw_url)
+                    target_url, detected_seg_dur = resolve_best_audio_stream_info(
+                        raw_url, stream_proxy=self.stream_proxy
+                    )
                     if detected_seg_dur is not None:
                         self.update_hls_manifest_metrics_from_seg_dur(detected_seg_dur)
                 else:
@@ -603,6 +718,8 @@ class AudioSidecarManager:
                     "2000000",
                 ]
                 if is_http:
+                    if self.stream_proxy:
+                        cmd.extend(["-http_proxy", self.stream_proxy])
                     cmd.extend(
                         [
                             "-reconnect",
@@ -612,7 +729,7 @@ class AudioSidecarManager:
                             "-reconnect_delay_max",
                             "4",
                             "-rw_timeout",
-                            "12000000",
+                            "8000000",
                             "-user_agent",
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4",
                         ]
@@ -658,14 +775,101 @@ class AudioSidecarManager:
                     lookahead_sec = 3.5  # Allow 3.5s initial burst to cover AI pipeline latency, then pace 1.0x
                     audio_fed_sec = 0.0
                     tap_start_perf = 0.0
-                    assert proc.stdout is not None
+                    proc_spawn_perf = time.perf_counter()
+                    last_chunk_perf = proc_spawn_perf
+                    win_t0 = 0.0
+                    win_audio0 = 0.0
+                    slow_warned = False
+
+                    pcm_q: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=96)
+                    stdout_pipe = proc.stdout
+                    assert stdout_pipe is not None
+
+                    def _stdout_reader(
+                        pipe=stdout_pipe,
+                        out_q: queue.Queue[Optional[bytes]] = pcm_q,
+                        stop_ev: threading.Event = ev_stop,
+                    ) -> None:
+                        try:
+                            while not stop_ev.is_set():
+                                data = pipe.read(chunk_size)
+                                if not data:
+                                    break
+                                while not stop_ev.is_set():
+                                    try:
+                                        out_q.put(data, timeout=0.5)
+                                        break
+                                    except queue.Full:
+                                        continue
+                        except Exception:
+                            pass
+                        finally:
+                            try:
+                                out_q.put_nowait(None)
+                            except queue.Full:
+                                pass
+
+                    threading.Thread(
+                        target=_stdout_reader,
+                        daemon=True,
+                        name=f"FFmpegRead-{channel_id}",
+                    ).start()
+
                     while not ev_stop.is_set():
-                        pcm_chunk = proc.stdout.read(chunk_size)
-                        if not pcm_chunk:
+                        try:
+                            pcm_chunk = pcm_q.get(timeout=1.0)
+                        except queue.Empty:
+                            now_p = time.perf_counter()
+                            if tap_start_perf == 0.0 and (now_p - proc_spawn_perf) > 8.0:
+                                print(
+                                    f"[Sidecar] First-audio timeout (>8.0s) on [{channel_name}] ({target_url}), failing over..."
+                                )
+                                if len(candidates) > 1:
+                                    with self._lock:
+                                        self._slow_urls.add(raw_url)
+                                break
+                            if tap_start_perf > 0.0 and (now_p - last_chunk_perf) > 6.5:
+                                print(
+                                    f"[Sidecar] Audio stream stalled (>6.5s) on [{channel_name}] ({target_url}), failing over..."
+                                )
+                                if len(candidates) > 1:
+                                    with self._lock:
+                                        self._slow_urls.add(raw_url)
+                                break
+                            continue
+
+                        if pcm_chunk is None:
                             break
+
+                        now_p = time.perf_counter()
+                        last_chunk_perf = now_p
                         if tap_start_perf == 0.0:
-                            tap_start_perf = time.perf_counter()
+                            tap_start_perf = now_p
+                            win_t0 = now_p
+                            win_audio0 = 0.0
                         audio_fed_sec += len(pcm_chunk) / 32000.0
+
+                        # Real-time cross-border throughput watchdog:
+                        # If an HD stream drips at e.g. 0.07x real-time (35 KB/s), FFmpeg's rw_timeout never fires,
+                        # causing 60-90s latency per sentence. Detect <0.68x over a 9s window and fail over!
+                        if is_http and win_t0 > 0.0 and (now_p - win_t0) >= 9.0:
+                            speed_ratio = (audio_fed_sec - win_audio0) / max(0.1, now_p - win_t0)
+                            win_t0 = now_p
+                            win_audio0 = audio_fed_sec
+                            if speed_ratio < 0.68:
+                                if len(candidates) > 1:
+                                    print(
+                                        f"[Sidecar] Upstream too slow ({speed_ratio:.2f}x < 0.68x real-time) on "
+                                        f"[{channel_name}] ({target_url}), failing over to faster candidate..."
+                                    )
+                                    with self._lock:
+                                        self._slow_urls.add(raw_url)
+                                    break
+                                elif not slow_warned:
+                                    slow_warned = True
+                                    print(
+                                        f"[Sidecar] Warning: single upstream for [{channel_name}] is slow ({speed_ratio:.2f}x real-time)."
+                                    )
 
                         events = self.pipeline.feed_pcm_s16le(pcm_chunk)
                         for ev in events:
@@ -711,17 +915,28 @@ class AudioSidecarManager:
         finally:
             print(f"[Sidecar] Audio tap stopped for [{channel_name}].")
 
-    def _handle_subtitle_event(self, ev: SubtitleEvent) -> None:
-        self.total_subtitles_emitted += 1
-        if self.auto_sync and ev.pipeline_elapsed_ms > 0:
+    def _handle_subtitle_event(
+        self, ev: SubtitleEvent, session_epoch: Optional[int] = None
+    ) -> None:
+        with self._lock:
+            if session_epoch is not None and session_epoch != self._session_epoch:
+                return
+            self.total_subtitles_emitted += 1
+            auto_sync = self.auto_sync
+            sub_delay = self.subtitle_delay_ms
+            lead_ms = self.auto_stream_lead_ms
+            disp_mode = self.display_mode
+            f_scale = self.font_scale
+
+        if auto_sync and ev.pipeline_elapsed_ms > 0:
             # Dynamic per-sentence compensation:
-            # Target alignment = auto_stream_lead_ms + user fine-tune offset (subtitle_delay_ms - 800)
+            # Target alignment = auto_stream_lead_ms + clamped user fine-tune offset (subtitle_delay_ms - 800)
             # Subtract the actual time already spent in VAD + clause aggregation + ASR + LLM!
-            fine_tune_ms = self.subtitle_delay_ms - 800
-            target_lead_ms = self.auto_stream_lead_ms + fine_tune_ms
+            fine_tune_ms = max(-3500, min(3500, sub_delay - 800))
+            target_lead_ms = lead_ms + fine_tune_ms
             effective_delay_ms = max(0, int(round(target_lead_ms - ev.pipeline_elapsed_ms)))
         else:
-            effective_delay_ms = self.subtitle_delay_ms
+            effective_delay_ms = sub_delay
 
         payload = {
             "type": "subtitle",
@@ -733,27 +948,43 @@ class AudioSidecarManager:
             "latency_ms": ev.latency_ms,
             "pipeline_elapsed_ms": ev.pipeline_elapsed_ms,
             "actual_delay_ms": effective_delay_ms,
-            "stream_lead_ms": self.auto_stream_lead_ms,
-            "auto_sync": self.auto_sync,
+            "stream_lead_ms": lead_ms,
+            "auto_sync": auto_sync,
             "engine_info": ev.engine_info,
-            "display_mode": self.display_mode,
-            "font_scale": self.font_scale,
+            "display_mode": disp_mode,
+            "font_scale": f_scale,
         }
-        if ev.is_final:
-            self.recent_subtitles.append(payload)
-            if len(self.recent_subtitles) > 60:
-                self.recent_subtitles = self.recent_subtitles[-60:]
-        self._schedule_broadcast(payload, delay_ms=effective_delay_ms)
+        with self._lock:
+            if session_epoch is not None and session_epoch != self._session_epoch:
+                return
+            if ev.is_final:
+                self.recent_subtitles.append(payload)
+                if len(self.recent_subtitles) > 60:
+                    self.recent_subtitles = self.recent_subtitles[-60:]
+        self._schedule_broadcast(
+            payload, delay_ms=effective_delay_ms, session_epoch=session_epoch
+        )
 
-    def _schedule_broadcast(self, payload: dict, delay_ms: int) -> None:
+    def _schedule_broadcast(
+        self,
+        payload: dict,
+        delay_ms: int,
+        session_epoch: Optional[int] = None,
+    ) -> None:
         if self._loop is None or self._loop.is_closed():
             return
 
         async def _delayed_send() -> None:
+            if session_epoch is not None:
+                with self._lock:
+                    if session_epoch != self._session_epoch:
+                        return
             if delay_ms > 0:
                 await asyncio.sleep(delay_ms / 1000.0)
             now = time.time()
             with self._lock:
+                if session_epoch is not None and session_epoch != self._session_epoch:
+                    return
                 self._last_broadcast_ts = now
                 if payload.get("type") == "subtitle":
                     self._last_subtitle_payload = payload

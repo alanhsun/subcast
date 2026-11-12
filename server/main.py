@@ -477,16 +477,10 @@ async def proxy_hls_manifest(
             candidate_urls.append(bu)
 
     sidecar = get_sidecar()
-    if need_translate:
-        sidecar.touch_channel(
-            channel_id=channel_id,
-            channel_name=name,
-            upstream_url=upstream_url,
-            candidate_urls=candidate_urls,
-        )
-    elif sidecar.active_channel_id and not sidecar.manual_pinned:
-        sidecar.stop_current()
-        await hub.broadcast({"type": "clear"})
+    if not need_translate:
+        if not sidecar.manual_pinned:
+            sidecar.stop_current()
+            await hub.broadcast({"type": "clear"})
 
     headers = {
         "User-Agent": request.headers.get(
@@ -500,15 +494,20 @@ async def proxy_hls_manifest(
                 if bu not in urls_to_fetch:
                     urls_to_fetch.append(bu)
 
+    matched_source_url = upstream_url
     final_url = upstream_url
     text = ""
     last_status = 502
-    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0, verify=False) as client:
+    stream_proxy = sidecar.stream_proxy or None
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=6.5, verify=False, proxy=stream_proxy
+    ) as client:
         for try_url in urls_to_fetch:
             try:
                 resp = await client.get(try_url, headers=headers)
                 last_status = resp.status_code
                 if resp.status_code < 400 and resp.text.strip():
+                    matched_source_url = try_url
                     final_url = str(resp.url)
                     text = resp.text
                     break
@@ -519,7 +518,16 @@ async def proxy_hls_manifest(
         raise HTTPException(status_code=last_status, detail="Upstream M3U8 error across all sources")
 
     if need_translate:
+        ordered_candidates = [matched_source_url] + [
+            u for u in candidate_urls if u and u != matched_source_url
+        ]
         sidecar.update_hls_manifest_metrics(text)
+        sidecar.touch_channel(
+            channel_id=channel_id,
+            channel_name=name,
+            upstream_url=matched_source_url,
+            candidate_urls=ordered_candidates,
+        )
 
     base_url = _resolve_base_url(request)
     rewritten = rewrite_m3u8_manifest(
@@ -548,17 +556,47 @@ async def proxy_direct_stream(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid stream token: {exc}") from exc
 
+    need_translate = True
+    backup_urls: List[str] = []
+    for ch in _channels:
+        if ch.id == channel_id:
+            name = ch.name or name
+            need_translate = ch.need_translate
+            break
+    base_name = name.split(" (源")[0].strip()
+    for ch in _channels:
+        ch_base = (ch.name or "").split(" (源")[0].strip()
+        if ch.id == channel_id or (base_name and ch_base == base_name):
+            if ch.url and ch.url not in backup_urls:
+                backup_urls.append(ch.url)
+
     sidecar = get_sidecar()
-    sidecar.touch_channel(channel_id=channel_id, channel_name=name, upstream_url=upstream_url)
+    if need_translate:
+        sidecar.touch_channel(
+            channel_id=channel_id,
+            channel_name=name,
+            upstream_url=upstream_url,
+            candidate_urls=[upstream_url] + [bu for bu in backup_urls if bu != upstream_url],
+        )
+    elif not sidecar.manual_pinned:
+        sidecar.stop_current()
+        await hub.broadcast({"type": "clear"})
+
+    stream_proxy = sidecar.stream_proxy or None
 
     async def _stream_generator():
-        client = httpx.AsyncClient(follow_redirects=True, timeout=None, verify=False)
+        client = httpx.AsyncClient(
+            follow_redirects=True, timeout=None, verify=False, proxy=stream_proxy
+        )
         try:
             async with client.stream("GET", upstream_url) as resp:
                 async for chunk in resp.aiter_bytes(chunk_size=32768):
-                    sidecar.touch_channel(
-                        channel_id=channel_id, channel_name=name, upstream_url=upstream_url
-                    )
+                    if need_translate:
+                        sidecar.touch_channel(
+                            channel_id=channel_id,
+                            channel_name=name,
+                            upstream_url=upstream_url,
+                        )
                     yield chunk
         finally:
             await client.aclose()
@@ -589,7 +627,10 @@ async def websocket_subtitles(ws: WebSocket) -> None:
                 action = data.get("action")
                 if action == "update_settings":
                     if "subtitle_delay_ms" in data:
-                        sidecar.subtitle_delay_ms = max(0, min(18000, int(data["subtitle_delay_ms"])))
+                        new_delay = max(0, min(18000, int(data["subtitle_delay_ms"])))
+                        if sidecar.auto_sync and new_delay > 3500:
+                            new_delay = 800
+                        sidecar.subtitle_delay_ms = new_delay
                     if "display_mode" in data:
                         sidecar.display_mode = str(data["display_mode"])
                     if "font_scale" in data:

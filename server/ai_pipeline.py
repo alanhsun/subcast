@@ -373,6 +373,10 @@ class StreamingSpeechPipeline:
         "the", "a", "an", "to", "of", "in", "on", "and", "or", "is", "it",
         "uh", "um", "ah", "oh", "hmm", "hm", "mm", "eh", "ha", "language",
     }
+    _CJK_FILLER_NOISE = {
+        "啊", "哦", "嗯", "呃", "哈", "噢", "呀", "诶", "唉", "喔",
+        "啊有", "嗯嗯", "啊啊", "哦哦", "哈哈", "呃呃", "噢噢",
+    }
 
     def __init__(
         self,
@@ -668,15 +672,23 @@ class StreamingSpeechPipeline:
 
         combined = self._get_combined_pending_text()
         word_count = self._count_words_or_units(combined)
-        is_complete = self._is_pending_grammatically_complete()
+        has_dangling = self._ends_with_dangling_word(combined)
+        is_complete = (not has_dangling) and (bool(combined) and combined[-1] in ".?!。？！")
         min_words, max_words, silence_flush_sec, max_wait_sec = self._get_mode_thresholds()
 
-        # 1. Hard cap on total words or waiting duration (both wall-clock & stream audio duration)
-        wait_sec = max(
-            (now - self._pending_first_ts) if self._pending_first_ts > 0 else 0.0,
-            self._pending_wait_samples / 16000.0,
-        )
-        if word_count >= max_words or wait_sec >= max_wait_sec:
+        # Measure actual stream audio elapsed rather than raw wall-clock so temporary network
+        # jitter between HLS segments never triggers premature mid-sentence flushes.
+        audio_wait_sec = self._pending_wait_samples / 16000.0
+        wall_wait_sec = (now - self._pending_first_ts) if self._pending_first_ts > 0 else 0.0
+        effective_max_words = (max_words + 8) if has_dangling else max_words
+        effective_max_wait = (max_wait_sec + 2.8) if has_dangling else max_wait_sec
+
+        # 1. Hard cap on total words or stream audio waiting duration (with emergency wall-clock safety cap)
+        if (
+            word_count >= effective_max_words
+            or audio_wait_sec >= effective_max_wait
+            or (not is_currently_speaking and wall_wait_sec >= effective_max_wait + 6.0)
+        ):
             return True
 
         # 2. Target full-sentence length reached and grammatically complete
@@ -687,7 +699,9 @@ class StreamingSpeechPipeline:
         if not is_currently_speaking:
             if is_complete and post_vad_silence_sec >= silence_flush_sec:
                 return True
-            if not is_complete and post_vad_silence_sec >= (silence_flush_sec + 0.85):
+            if not is_complete and post_vad_silence_sec >= (
+                silence_flush_sec + (1.35 if has_dangling else 0.85)
+            ):
                 return True
 
         return False
@@ -695,15 +709,21 @@ class StreamingSpeechPipeline:
     def _flush_pending_to_event(self) -> Optional[SubtitleEvent]:
         combined = self._get_combined_pending_text()
         first_ts = self._pending_first_ts
+        wait_samples = self._pending_wait_samples
         post_silence_ms = (self._samples_since_vad_pop / 16000.0) * 1000.0
         self._pending_clauses = []
         self._pending_first_ts = 0.0
         self._pending_wait_samples = 0
         self._samples_since_vad_pop = 0
-        if not combined or len(combined.strip(" .,?!。，？！")) < 2:
+        stripped_core = re.sub(r"[\s.,?!;:。，？！；：、…—\-~～\"'“”‘’()（）]+", "", combined)
+        if not combined or len(stripped_core) < 2 and not any("\u4e00" <= c <= "\u9fff" for c in stripped_core):
+            return None
+        if not stripped_core:
             return None
 
-        # Filter standalone single-word noise hallucinations ("the.", "a.", "language.")
+        # Filter standalone single-word noise & commercial music filler hallucinations ("the.", "啊，有。")
+        if stripped_core in self._CJK_FILLER_NOISE:
+            return None
         latin_tokens = re.findall(r"[A-Za-z\u00C0-\u017F]+", combined.lower())
         has_cjk = any("\u3040" <= c <= "\u9fff" or "\uac00" <= c <= "\ud7af" for c in combined)
         if len(latin_tokens) == 1 and not has_cjk and latin_tokens[0] in self._NOISE_SINGLE_WORDS:
@@ -713,7 +733,9 @@ class StreamingSpeechPipeline:
             combined += "."
 
         now_ts = time.time()
-        agg_span_ms = max(0.0, (now_ts - first_ts) * 1000.0) if first_ts > 0 else 0.0
+        audio_span_ms = (wait_samples / 16000.0) * 1000.0
+        wall_span_ms = max(0.0, (now_ts - first_ts) * 1000.0) if first_ts > 0 else 0.0
+        agg_span_ms = audio_span_ms if audio_span_ms > 0 else wall_span_ms
         pre_llm_elapsed_ms = self._pending_last_asr_ms + post_silence_ms + min(1200.0, agg_span_ms * 0.35)
 
         if self.async_translate_mode:

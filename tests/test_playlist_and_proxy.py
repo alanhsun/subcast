@@ -190,3 +190,99 @@ def test_epg_and_foreign_playlist_routes() -> None:
         assert r_foreign.status_code == 200
         assert "CGTN" in r_foreign.text
         assert "CCTV1," not in r_foreign.text
+
+
+def test_channel_switch_cancels_delayed_subtitles_and_switches_sources() -> None:
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from server.ai_pipeline import SubtitleEvent
+    from server.stream_proxy import (
+        AudioSidecarManager,
+        _discover_sibling_master_urls,
+        _rank_audio_candidates,
+    )
+
+    # 1. Verify sibling Master M3U8 discovery from high-bitrate single-variant URLs
+    assert "https://cdn.example.com/live/master.m3u8" in _discover_sibling_master_urls(
+        "https://cdn.example.com/live/master_6500000.m3u8"
+    )
+    assert "https://cdn.example.com/dw/master.m3u8" in _discover_sibling_master_urls(
+        "https://cdn.example.com/dw/01.m3u8"
+    )
+    assert "https://cdn.example.com/fox/master.m3u8" in _discover_sibling_master_urls(
+        "https://cdn.example.com/fox/highw/index.m3u8"
+    )
+
+    # 2. Verify slow URL demotion and Master M3U8 preference
+    ranked = _rank_audio_candidates(
+        "https://slow.ro/liveibu5_highw/index.m3u8",
+        [
+            "https://slow.ro/liveibu5_highw/index.m3u8",
+            "https://fast.amagi.tv/playlist.m3u8",
+        ],
+        slow_urls={"https://slow.ro/liveibu5_highw/index.m3u8"},
+    )
+    assert ranked[0] == "https://fast.amagi.tv/playlist.m3u8"
+
+    # 3. Verify delayed subtitle from previous channel is 100% cancelled after channel switch or stop
+    async def _run_epoch_test() -> None:
+        received: list[dict] = []
+
+        async def _cb(msg: dict) -> None:
+            received.append(msg)
+
+        fake_pipeline = MagicMock()
+        fake_pipeline.sentence_mode = "full_sentence"
+        sidecar = AudioSidecarManager(pipeline=fake_pipeline, broadcast_cb=_cb)
+        sidecar.attach_loop(asyncio.get_running_loop())
+
+        try:
+            old_epoch = sidecar._session_epoch
+            ev_old = SubtitleEvent(
+                channel="Al Jazeera",
+                en="Previous channel sentence that was delayed by auto_sync.",
+                zh="上一频道因延迟补偿尚在排队等待发送的旧字幕。",
+                is_final=True,
+                timestamp=1000.0,
+                latency_ms=400.0,
+                pipeline_elapsed_ms=900.0,
+            )
+            sidecar.auto_sync = False
+            sidecar.subtitle_delay_ms = 220
+            sidecar._handle_subtitle_event(ev_old, session_epoch=old_epoch)
+
+            # Switch channel / stop after 40ms (while ev_old is still sleeping for 220ms)
+            await asyncio.sleep(0.04)
+            sidecar.stop_current()
+            await asyncio.sleep(0.28)
+
+            # Old channel's subtitle must NEVER arrive or overwrite _last_subtitle_payload!
+            leaked = [m for m in received if m.get("type") == "subtitle"]
+            assert leaked == [], f"Stale delayed subtitle leaked after channel switch: {leaked}"
+            assert sidecar._last_subtitle_payload is None
+
+            # 4. Verify switching between Source 1 and Source 2 of same channel name updates active_channel_id
+            sidecar._audio_tap_worker = lambda *a, **kw: __import__("time").sleep(0.4)  # type: ignore[method-assign]
+            sidecar._translation_worker = lambda *a, **kw: None  # type: ignore[method-assign]
+
+            sidecar.touch_channel(
+                channel_id="src1_id",
+                channel_name="LiveNOW from FOX福克斯现场 (源1)",
+                upstream_url="https://slow.ro/index.m3u8",
+            )
+            assert sidecar.active_channel_id == "src1_id"
+
+            sidecar.touch_channel(
+                channel_id="src2_id",
+                channel_name="LiveNOW from FOX福克斯现场 (源2)",
+                upstream_url="https://fast.amagi.tv/playlist.m3u8",
+            )
+            assert sidecar.active_channel_id == "src2_id"
+            assert sidecar.active_upstream_url == "https://fast.amagi.tv/playlist.m3u8"
+        finally:
+            sidecar.stop_current()
+            if sidecar._watchdog_task:
+                sidecar._watchdog_task.cancel()
+
+    asyncio.run(_run_epoch_test())
