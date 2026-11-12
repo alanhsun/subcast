@@ -589,7 +589,7 @@ async def websocket_subtitles(ws: WebSocket) -> None:
                 action = data.get("action")
                 if action == "update_settings":
                     if "subtitle_delay_ms" in data:
-                        sidecar.subtitle_delay_ms = max(0, min(8000, int(data["subtitle_delay_ms"])))
+                        sidecar.subtitle_delay_ms = max(0, min(18000, int(data["subtitle_delay_ms"])))
                     if "display_mode" in data:
                         sidecar.display_mode = str(data["display_mode"])
                     if "font_scale" in data:
@@ -874,7 +874,7 @@ async def api_update_playlist(payload: PlaylistUpdatePayload) -> dict:
 async def api_update_settings(payload: SettingsUpdatePayload) -> dict:
     sidecar = get_sidecar()
     if payload.subtitle_delay_ms is not None:
-        sidecar.subtitle_delay_ms = max(0, min(8000, payload.subtitle_delay_ms))
+        sidecar.subtitle_delay_ms = max(0, min(18000, payload.subtitle_delay_ms))
     if payload.display_mode in ("bilingual", "zh_only"):
         sidecar.display_mode = payload.display_mode
     if payload.font_scale is not None:
@@ -1713,7 +1713,7 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
         </label>
         <div class="ctrl-item">
           <span class="ctrl-label">手动偏移</span>
-          <input type="range" id="delaySlider" min="0" max="5000" step="100" value="800" oninput="onDelayInput(this.value)" onchange="saveSettings()">
+          <input type="range" id="delaySlider" min="0" max="15000" step="100" value="800" oninput="onDelayInput(this.value)" onchange="saveSettings()">
           <span id="delayVal" class="mono" style="font-size:12.5px; min-width:34px; text-align:right;">0.8s</span>
         </div>
       </div>

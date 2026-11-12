@@ -45,26 +45,27 @@ def _unwrap_beacon_url(url: str) -> str:
     return url
 
 
-def resolve_best_audio_stream_url(url: str, timeout: float = 5.5) -> str:
+def resolve_best_audio_stream_info(url: str, timeout: float = 5.5) -> tuple[str, Optional[float]]:
     """
-    Resolves a Master M3U8 into its single best audio sub-playlist URL so FFmpeg does not:
+    Resolves a Master M3U8 into its single best audio sub-playlist URL and extracts its
+    average segment duration (seconds) so FFmpeg does not:
     1) Download all 4~8 video resolution variants simultaneously (causing 15-25s timeouts),
     2) Miss demuxed audio tracks (#EXT-X-MEDIA:TYPE=AUDIO,URI="..."), or
     3) Abort on dead subtitle sub-playlists (#EXT-X-MEDIA:TYPE=SUBTITLES -> 404).
     """
     clean_url = _unwrap_beacon_url(url)
     if ".m3u8" not in clean_url.lower():
-        return clean_url
+        return clean_url, None
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"}
     try:
         with httpx.Client(follow_redirects=True, timeout=timeout, verify=False) as client:
             resp = client.get(clean_url, headers=headers)
             if resp.status_code >= 400:
-                return clean_url
+                return clean_url, None
             base_url = str(resp.url)
             text = resp.text
             if "#EXT-X-STREAM-INF" not in text and "#EXT-X-MEDIA" not in text:
-                return base_url
+                return base_url, extract_hls_segment_duration(text)
 
             lines = [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -82,7 +83,7 @@ def resolve_best_audio_stream_url(url: str, timeout: float = 5.5) -> str:
                 try:
                     r_aud = client.get(a_url, headers=headers)
                     if r_aud.status_code < 400 and "#EXTINF" in r_aud.text:
-                        return str(r_aud.url)
+                        return str(r_aud.url), extract_hls_segment_duration(r_aud.text)
                 except Exception:
                     pass
 
@@ -103,13 +104,17 @@ def resolve_best_audio_stream_url(url: str, timeout: float = 5.5) -> str:
                     try:
                         r_var = client.get(v_url, headers=headers)
                         if r_var.status_code < 400 and "#EXTM3U" in r_var.text.upper():
-                            return str(r_var.url)
+                            return str(r_var.url), extract_hls_segment_duration(r_var.text)
                     except Exception:
                         pass
-                return variants[0][1]
+                return variants[0][1], None
     except Exception:
         pass
-    return clean_url
+    return clean_url, None
+
+
+def resolve_best_audio_stream_url(url: str, timeout: float = 5.5) -> str:
+    return resolve_best_audio_stream_info(url, timeout=timeout)[0]
 
 
 def _get_ffmpeg_extra_args(ffmpeg_bin: str) -> List[str]:
@@ -380,12 +385,24 @@ class AudioSidecarManager:
             except Exception:
                 pass
 
+    def update_hls_manifest_metrics_from_seg_dur(self, seg_dur: float) -> None:
+        """
+        Calculates the stream lead (ms) between our paced FFmpeg audio tap and the TV video player.
+        - For seg_dur < 6.0s: FFmpeg starts at -live_start_index -1 (with a 3.5s initial lookahead burst,
+          then paced at 1.0x real-time), while TV players (ExoPlayer/IJK) buffer at ~ -2.5..-3.
+        - For seg_dur >= 6.0s (e.g. 10s segments on Al Jazeera): FFmpeg starts at -live_start_index -2
+          (with a 3.5s initial burst, then 1.0x real-time pacing), keeping lead around ~12.5s instead of 25s.
+        """
+        if seg_dur >= 6.0:
+            estimated_lead = int(round(seg_dur * 950.0 + 3500.0))
+        else:
+            estimated_lead = int(round(seg_dur * 1350.0 + min(3500.0, seg_dur * 800.0)))
+        self.auto_stream_lead_ms = max(2800, min(18000, estimated_lead))
+
     def update_hls_manifest_metrics(self, manifest_text: str) -> None:
         seg_dur = extract_hls_segment_duration(manifest_text)
         if seg_dur is not None:
-            # TV players (ExoPlayer/IJK) typically buffer ~2.0 segments behind FFmpeg's live_start_index=-1 edge
-            estimated_lead = int(round(seg_dur * 1900.0))
-            self.auto_stream_lead_ms = max(2400, min(6800, estimated_lead))
+            self.update_hls_manifest_metrics_from_seg_dur(seg_dur)
 
     def get_status(self) -> SidecarStatus:
         with self._lock:
@@ -506,7 +523,12 @@ class AudioSidecarManager:
                 raw_url = candidates[cand_idx % len(candidates)]
                 cand_idx += 1
                 is_http = raw_url.lower().startswith(("http://", "https://"))
-                target_url = resolve_best_audio_stream_url(raw_url) if is_http else raw_url
+                if is_http:
+                    target_url, detected_seg_dur = resolve_best_audio_stream_info(raw_url)
+                    if detected_seg_dur is not None:
+                        self.update_hls_manifest_metrics_from_seg_dur(detected_seg_dur)
+                else:
+                    target_url, detected_seg_dur = raw_url, None
                 is_hls = ".m3u8" in target_url.lower() or ".m3u8" in raw_url.lower()
 
                 with self._lock:
@@ -541,9 +563,10 @@ class AudioSidecarManager:
                     )
                 if is_hls:
                     cmd.extend(extra_hls_args)
-                    # Start FFmpeg audio tap at the newest live edge segment (-1) so AI transcription
-                    # naturally runs 3~6s ahead of the TV video player's 2~3 segment buffer.
-                    cmd.extend(["-live_start_index", "-1"])
+                    # For long-segment HLS streams (>=6s, e.g. Al Jazeera 10s segments), start at -2
+                    # instead of -1 so FFmpeg is ~10-12s ahead of the TV player rather than 20-25s ahead.
+                    start_idx = "-2" if (detected_seg_dur and detected_seg_dur >= 6.0) else "-1"
+                    cmd.extend(["-live_start_index", start_idx])
                 cmd.extend(
                     [
                         "-i",
@@ -574,18 +597,37 @@ class AudioSidecarManager:
                             return
                         self._ffmpeg_proc = proc
 
-                    chunk_size = 3200  # 100ms of 16kHz 16-bit mono PCM
+                    chunk_size = 3200  # 100ms of 16kHz 16-bit mono PCM (32000 bytes/sec)
+                    lookahead_sec = 3.5  # Allow 3.5s initial burst to cover AI pipeline latency, then pace 1.0x
+                    audio_fed_sec = 0.0
+                    tap_start_perf = 0.0
                     assert proc.stdout is not None
                     while not self._stop_event.is_set():
                         pcm_chunk = proc.stdout.read(chunk_size)
                         if not pcm_chunk:
                             break
+                        if tap_start_perf == 0.0:
+                            tap_start_perf = time.perf_counter()
+                        audio_fed_sec += len(pcm_chunk) / 32000.0
+
                         events = self.pipeline.feed_pcm_s16le(pcm_chunk)
                         for ev in events:
                             try:
                                 self._translate_queue.put_nowait(ev)
                             except queue.Full:
                                 pass
+
+                        # Real-time 1.0x pacing after initial 3.5s lookahead burst so 10s .ts segments
+                        # are never burst-decoded all at once 8-10s ahead of their natural speech time
+                        if is_http and audio_fed_sec > lookahead_sec:
+                            target_elapsed = audio_fed_sec - lookahead_sec
+                            actual_elapsed = time.perf_counter() - tap_start_perf
+                            sleep_sec = target_elapsed - actual_elapsed
+                            if 0.01 < sleep_sec <= 1.5:
+                                if self._stop_event.wait(sleep_sec):
+                                    break
+                            elif sleep_sec < -4.0:
+                                tap_start_perf = time.perf_counter() - target_elapsed
                 except Exception as inner_exc:
                     print(f"[Sidecar] Audio tap attempt error on [{channel_name}] ({target_url}): {inner_exc}")
                 finally:
