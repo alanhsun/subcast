@@ -178,4 +178,46 @@ def test_filler_hallucination_filter_and_jitter_safe_dangling_wait() -> None:
     )
 
 
+def test_proportional_multi_sentence_splitting_and_stutter_dedup() -> None:
+    pipeline = StreamingSpeechPipeline()
+    pipeline.reset_stream(channel_name="Bloomberg TV")
+    pipeline.async_translate_mode = True
+
+    # 1. Multi-sentence fast-anchor VAD chunk must split at genuine sentence boundaries
+    # while keeping "U.S." intact and assigning proportional 16kHz sample ranges
+    raw_multi = (
+        "Difficult to predict where different states will go. "
+        "I mean, everyone thought in Washington U.S. officials would wait. "
+        "So this"
+    )
+    clauses = pipeline._split_asr_into_clauses_with_samples(
+        raw_multi, seg_start_sample=16000, seg_end_sample=168000
+    )
+    assert len(clauses) == 3, f"Expected 3 proportional clauses, got: {clauses}"
+    assert clauses[0][0] == "Difficult to predict where different states will go."
+    assert "U.S. officials would wait." in clauses[1][0]
+    assert clauses[2][0] == "So this"
+    assert clauses[0][1] == 16000
+    assert clauses[0][2] == clauses[1][1]
+    assert clauses[1][2] == clauses[2][1]
+    assert clauses[2][2] == 168000
+    assert 40000 < clauses[1][1] < 140000
+
+    # 2. Dangling connector with false ASR period ("announced that. The central bank...") must NOT split
+    no_split = pipeline._split_asr_into_clauses_with_samples(
+        "The Prime Minister announced that. The central bank will pause.",
+        seg_start_sample=0,
+        seg_end_sample=80000,
+    )
+    assert len(no_split) == 1
+
+    # 3. Consecutive ASR boundary stutter ("when when") is deduplicated cleanly
+    pipeline._append_clause_to_pending("We will see what happens when.", 300.0, 0, 32000)
+    pipeline._append_clause_to_pending("When the market opens tomorrow morning.", 302.0, 32000, 72000)
+    merged = pipeline._get_combined_pending_text()
+    assert "when when" not in merged.lower()
+    assert "happens when the market opens" in merged
+
+
+
 

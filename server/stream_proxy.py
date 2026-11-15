@@ -93,36 +93,33 @@ def _discover_sibling_master_urls(base_url: str) -> List[str]:
     return candidates[:3]
 
 
-def resolve_best_audio_stream_info(
+def resolve_best_audio_stream_detail(
     url: str,
-    timeout: float = 5.5,
+    timeout: float = 6.5,
     stream_proxy: str = "",
-) -> tuple[str, Optional[float]]:
+) -> tuple[str, Optional[float], str]:
     """
     Resolves a Master M3U8 (or single-bitrate variant with a sibling Master M3U8) into its
-    single best audio sub-playlist URL and extracts its average segment duration (seconds) so FFmpeg does not:
-    1) Download all 4~8 video resolution variants simultaneously (causing 15-25s timeouts),
-    2) Pull a 4-6 Mbps 1080p stream across slow cross-border links when a 64-480 kbps sibling exists,
-    3) Miss demuxed audio tracks (#EXT-X-MEDIA:TYPE=AUDIO,URI="..."), or
-    4) Abort on dead subtitle sub-playlists (#EXT-X-MEDIA:TYPE=SUBTITLES -> 404).
+    single best audio sub-playlist URL, average segment duration (seconds), and raw Media M3U8 text
+    so `_audio_tap_worker` never needs a second cold cross-border TLS handshake to ingest PTS!
     """
     clean_url = _unwrap_beacon_url(url)
     if ".m3u8" not in clean_url.lower():
-        return clean_url, None
+        return clean_url, None, ""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"}
-    client_kwargs: dict = {"follow_redirects=True": True}
     client_opts: dict = {"follow_redirects": True, "timeout": timeout, "verify": False}
     if stream_proxy:
         client_opts["proxy"] = stream_proxy
-    del client_kwargs
     try:
         with httpx.Client(**client_opts) as client:
             resp = client.get(clean_url, headers=headers)
             if resp.status_code >= 400:
-                return clean_url, None
+                return clean_url, None, ""
             base_url = str(resp.url)
             text = resp.text
             if "#EXT-X-STREAM-INF" not in text and "#EXT-X-MEDIA" not in text:
+                orig_base = base_url
+                orig_text = text
                 for sib_url in _discover_sibling_master_urls(base_url):
                     try:
                         r_sib = client.get(sib_url, headers=headers, timeout=2.5)
@@ -135,7 +132,7 @@ def resolve_best_audio_stream_info(
                     except Exception:
                         pass
                 if "#EXT-X-STREAM-INF" not in text and "#EXT-X-MEDIA" not in text:
-                    return base_url, extract_hls_segment_duration(text)
+                    return orig_base, extract_hls_segment_duration(orig_text), orig_text
 
             lines = [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -152,8 +149,8 @@ def resolve_best_audio_stream_info(
             for _, a_url in audio_candidates:
                 try:
                     r_aud = client.get(a_url, headers=headers)
-                    if r_aud.status_code < 400 and "#EXTINF" in r_aud.text:
-                        return str(r_aud.url), extract_hls_segment_duration(r_aud.text)
+                    if r_aud.status_code < 400 and "#EXTINF" in r_aud.text.upper():
+                        return str(r_aud.url), extract_hls_segment_duration(r_aud.text), r_aud.text
                 except Exception:
                     pass
 
@@ -174,13 +171,24 @@ def resolve_best_audio_stream_info(
                     try:
                         r_var = client.get(v_url, headers=headers)
                         if r_var.status_code < 400 and "#EXTM3U" in r_var.text.upper():
-                            return str(r_var.url), extract_hls_segment_duration(r_var.text)
+                            return str(r_var.url), extract_hls_segment_duration(r_var.text), r_var.text
                     except Exception:
                         pass
-                return variants[0][1], None
+                return variants[0][1], None, ""
     except Exception:
         pass
-    return clean_url, None
+    return clean_url, None, ""
+
+
+def resolve_best_audio_stream_info(
+    url: str,
+    timeout: float = 5.5,
+    stream_proxy: str = "",
+) -> tuple[str, Optional[float]]:
+    target_u, seg_dur, _ = resolve_best_audio_stream_detail(
+        url, timeout=timeout, stream_proxy=stream_proxy
+    )
+    return target_u, seg_dur
 
 
 def resolve_best_audio_stream_url(url: str, timeout: float = 5.5, stream_proxy: str = "") -> str:
@@ -277,6 +285,7 @@ class HlsTimelineClock:
         self.uses_pdt: bool = False
         self._url_to_seg: OrderedDict[str, HlsSegmentMeta] = OrderedDict()
         self._path_to_seg: OrderedDict[str, HlsSegmentMeta] = OrderedDict()
+        self._seq_to_meta: OrderedDict[int, HlsSegmentMeta] = OrderedDict()
         self._init_paths: set[str] = set()
         self._shared_seq_pts: dict[int, float] = {}
         self._shared_avg_dur: float = 0.0
@@ -290,11 +299,46 @@ class HlsTimelineClock:
         with self._lock:
             return path in self._init_paths or seg_url in self._init_paths
 
+    def _lookup_by_seq_locked(self, clean_url: str, norm_path: str) -> Optional[HlsSegmentMeta]:
+        """
+        Cross-variant sequence fallback: when TV watches e.g. `/AJE/01_246199106.ts` (or `BP-HD-4/21695204.ts`)
+        while FFmpeg taps `/AJE/05_246199106.ts` (or `BP-HD-7/21695204.ts`), URL paths differ across ABR tiers
+        but `#EXT-X-MEDIA-SEQUENCE` numbers (`246199106`, `21695204`) are identical!
+        """
+        if not self._seq_to_meta:
+            return None
+        stem = posixpath.splitext(posixpath.basename(norm_path))[0]
+        nums = [int(x) for x in re.findall(r"\d+", stem)]
+        if not nums:
+            return None
+        min_known = min(self._seq_to_meta.keys())
+        for cand_sq in reversed(nums):
+            if cand_sq < 10 and min_known >= 25:
+                continue
+            exact = self._seq_to_meta.get(cand_sq)
+            if exact is not None:
+                return exact
+            nearest_sq = min(self._seq_to_meta.keys(), key=lambda k: abs(k - cand_sq))
+            if abs(cand_sq - nearest_sq) <= 10 and (cand_sq >= 50 or min_known < 50):
+                ref = self._seq_to_meta[nearest_sq]
+                extrap_pts = round(ref.start_pts + (cand_sq - nearest_sq) * ref.duration, 3)
+                return HlsSegmentMeta(
+                    seq=cand_sq,
+                    url=clean_url,
+                    norm_path=norm_path,
+                    start_pts=extrap_pts,
+                    duration=ref.duration,
+                )
+        return None
+
     def lookup_segment(self, seg_url: str) -> Optional[HlsSegmentMeta]:
         clean = _unwrap_beacon_url(seg_url)
         path = _norm_seg_path(clean)
         with self._lock:
-            return self._url_to_seg.get(clean) or self._path_to_seg.get(path)
+            hit = self._url_to_seg.get(clean) or self._path_to_seg.get(path)
+            if hit is not None:
+                return hit
+            return self._lookup_by_seq_locked(clean, path)
 
     def lookup_segment_pts(self, seg_url: str) -> Optional[float]:
         meta = self.lookup_segment(seg_url)
@@ -471,12 +515,16 @@ class HlsTimelineClock:
                 self._url_to_seg.move_to_end(abs_seg)
                 self._path_to_seg[npath] = meta
                 self._path_to_seg.move_to_end(npath)
+                self._seq_to_meta[sq] = meta
+                self._seq_to_meta.move_to_end(sq)
                 metas.append(meta)
 
             while len(self._url_to_seg) > 512:
                 self._url_to_seg.popitem(last=False)
             while len(self._path_to_seg) > 512:
                 self._path_to_seg.popitem(last=False)
+            while len(self._seq_to_meta) > 512:
+                self._seq_to_meta.popitem(last=False)
             return metas
 
 
@@ -484,15 +532,14 @@ def apply_m3u8_holdback(
     manifest_text: str,
     target_lead_sec: float = 9.5,
     min_keep_segments: int = 4,
+    inject_start_tag: bool = False,
 ) -> tuple[str, int]:
     """
-    RFC 8216 compliant zero-transcode M3U8 tail hold-back gate for short-segment live channels:
-    - When `seg_dur < 4.5s` (e.g. 2s segments where default TV buffer ~4.4s is shorter than a 6-7s
-      spoken English sentence + AI translation), safely trims `K` newest tail segments from the M3U8
-      served to the TV while ALWAYS preserving `>= min_keep_segments` (4) segments and keeping
-      `#EXT-X-MEDIA-SEQUENCE` 100% valid.
-    - Adds 0ms channel-switching penalty and zero CDN expiration risk because held-back segments
-      remain live inside the upstream sliding window while NAS FFmpeg taps the untrimmed live edge.
+    RFC 8216 compliant zero-transcode M3U8 tail hold-back gate + deterministic `#EXT-X-START`:
+    - Safely trims `K` newest tail segments when `avg_dur < 7.5s` so the live edge tapped by FFmpeg
+      (`-live_start_index -1`) stays ~11s-13s ahead of the TV while ALWAYS preserving `>= min_keep_segments` (4).
+    - Optionally injects `#EXT-X-START:TIME-OFFSET=-X.X,PRECISE=NO` so ExoPlayer & IjkPlayer start at
+      exact frame 0 (`pts`) of a deterministic segment boundary without mid-segment seek or 1.03x speed drift.
     """
     upper_all = manifest_text.upper()
     if (
@@ -549,25 +596,33 @@ def apply_m3u8_holdback(
                 segment_blocks[-1][1].append(stripped)
 
     total_segs = len(segment_blocks)
-    if total_segs <= min_keep_segments:
+    if total_segs == 0:
         return manifest_text, 0
 
     avg_dur = sum(d for d, _ in segment_blocks) / total_segs
-    if avg_dur >= 4.5:
-        return manifest_text, 0
+    trim_k = 0
+    if total_segs > min_keep_segments and avg_dur < 7.5:
+        natural_lead_sec = 2.0 * avg_dur
+        deficit_sec = target_lead_sec - natural_lead_sec
+        if deficit_sec > 0.4:
+            needed_k = int(math.ceil(deficit_sec / max(0.5, avg_dur)))
+            trim_k = max(0, min(needed_k, total_segs - min_keep_segments, 8))
 
-    natural_lead_sec = 2.2 * avg_dur
-    deficit_sec = target_lead_sec - natural_lead_sec
-    if deficit_sec <= 0.4:
-        return manifest_text, 0
+    kept_blocks = segment_blocks[:-trim_k] if trim_k > 0 else segment_blocks
+    kept_count = len(kept_blocks)
 
-    needed_k = int(math.ceil(deficit_sec / max(0.5, avg_dur)))
-    trim_k = min(needed_k, total_segs - min_keep_segments, 8)
-    if trim_k <= 0:
+    if trim_k == 0 and (not inject_start_tag or "#EXT-X-START:" in upper_all or kept_count < 2):
         return manifest_text, 0
 
     out_lines: List[str] = list(header_lines)
-    for _, blk in segment_blocks[:-trim_k]:
+    if inject_start_tag and "#EXT-X-START:" not in upper_all and kept_count >= 2:
+        # Target ~11.5s behind FFmpeg (-live_start_index -1), snapped with PRECISE=NO to exact segment start_pts
+        rem_lead = max(avg_dur * 1.5, 11.5 - max(0, trim_k - 1) * avg_dur)
+        m_segs = min(kept_count, max(2, int(round(rem_lead / max(0.5, avg_dur)))))
+        start_offset = round((m_segs - 0.15) * avg_dur, 1)
+        out_lines.append(f"#EXT-X-START:TIME-OFFSET=-{start_offset:.1f},PRECISE=NO")
+
+    for _, blk in kept_blocks:
         out_lines.extend(blk)
     return "\n".join(out_lines) + "\n", trim_k
 
@@ -575,12 +630,11 @@ def apply_m3u8_holdback(
 @dataclass
 class ClientPlayheadTracker:
     """
-    Per-TV closed-loop HLS playhead estimator driven by actual `/seg/{seg_name}` completion timestamps:
-    - Anchors playback start `pts_anchor` to the first requested segment once the initial ~2.0s
-      startup pre-buffer has been delivered.
+    Per-TV closed-loop HLS playhead estimator driven by progressive `/seg/{seg_name}` `[start_wall, done_wall]`:
+    - Accounts for progressive MPEG-TS decoding (`bufferForPlaybackMs` ~2.2s arrives mid-transfer on 6s-10s segments!).
     - Keeps playhead advancing smoothly at 1.0x during normal forward pre-fetches (`Playhead <= pts`).
-    - Automatically shifts `wall_anchor` forward by the exact stall duration whenever network underrun
-      causes a segment to finish arriving AFTER the predicted playhead (`Playhead > pts`, causality bound).
+    - Shifts `wall_anchor` forward by the exact stall duration whenever network underrun violates causality,
+      while enforcing a steady-state live-buffer ceiling so initial startup lag never drifts permanently.
     """
 
     client_key: str
@@ -588,6 +642,8 @@ class ClientPlayheadTracker:
     wall_anchor: float = 0.0
     first_pts: float = 0.0
     accum_startup_dur: float = 0.0
+    startup_burst_dur: float = 0.0
+    in_startup_burst: bool = True
     last_seq: int = -1
     last_pts: float = 0.0
     last_dur: float = 0.0
@@ -597,6 +653,9 @@ class ClientPlayheadTracker:
     last_delivered_payload: Optional[dict] = None
     last_delivered_ts: float = 0.0
     last_broadcast_ts: float = 0.0
+    last_delivered_onset: float = -1e9
+    last_speech_end_pts: Optional[float] = None
+    cleared_after_speech: bool = False
 
     def is_fresh(self, now_wall: float, max_idle_sec: float = 30.0) -> bool:
         return (
@@ -611,8 +670,17 @@ class ClientPlayheadTracker:
     def predict_wall_time(self, target_pts: float) -> float:
         return self.wall_anchor + (target_pts - self.pts_anchor)
 
-    def on_segment_delivered(self, pts: float, dur: float, seq: int, done_wall: float) -> None:
+    def on_segment_delivered(
+        self,
+        pts: float,
+        dur: float,
+        seq: int,
+        done_wall: float,
+        start_wall: Optional[float] = None,
+    ) -> None:
         safe_dur = max(0.2, dur)
+        s_wall = start_wall if (start_wall is not None and start_wall <= done_wall) else done_wall
+        xfer_sec = max(0.0, done_wall - s_wall)
         is_discontinuity = (
             not self.calibrated
             or (
@@ -622,14 +690,17 @@ class ClientPlayheadTracker:
             )
             or (
                 self.last_done_wall > 0.0
-                and (done_wall - self.last_done_wall) > max(22.0, safe_dur * 5.5)
+                and (s_wall - self.last_done_wall) > max(22.0, safe_dur * 5.5)
             )
         )
         if is_discontinuity:
+            ready_wall = s_wall + xfer_sec * min(1.0, 2.2 / safe_dur)
             self.first_pts = pts
             self.pts_anchor = pts
-            self.wall_anchor = done_wall + 0.12
+            self.wall_anchor = ready_wall + 0.12
             self.accum_startup_dur = safe_dur
+            self.startup_burst_dur = safe_dur
+            self.in_startup_burst = True
             self.calibrated = True
         elif seq >= 0 and seq == self.last_seq:
             # Range / retry fetch of same segment: shift only if causality was violated
@@ -638,22 +709,37 @@ class ClientPlayheadTracker:
                 self.wall_anchor = done_wall + 0.08
                 self.stall_count += 1
         else:
+            if self.in_startup_burst:
+                if (s_wall - self.last_done_wall) < max(0.55, safe_dur * 0.45):
+                    self.startup_burst_dur = min(24.0, self.startup_burst_dur + safe_dur)
+                else:
+                    self.in_startup_burst = False
+
             if self.accum_startup_dur < 2.0:
-                # Startup pre-buffer (<2.0s) still filling: playback of first_pts starts once filled
+                rem = max(0.0, 2.0 - self.accum_startup_dur)
+                ready_wall = s_wall + xfer_sec * min(1.0, rem / safe_dur)
                 self.accum_startup_dur += safe_dur
                 self.pts_anchor = self.first_pts
-                self.wall_anchor = max(self.wall_anchor, done_wall + 0.10)
+                self.wall_anchor = max(self.wall_anchor, ready_wall + 0.10)
             else:
-                cur_playhead = self.predict_playhead_pts(done_wall)
-                if cur_playhead > pts + 0.08:
-                    # Physical causality violation: player buffer ran dry waiting for this segment!
+                cur_at_start = self.predict_playhead_pts(s_wall)
+                cur_at_done = self.predict_playhead_pts(done_wall)
+                if cur_at_start > pts + 0.08:
+                    # Physical causality violation: player buffer ran dry before this segment arrived!
+                    rebuf_ready = s_wall + xfer_sec * min(1.0, 2.2 / safe_dur)
                     self.pts_anchor = pts
-                    self.wall_anchor = done_wall + 0.08
+                    self.wall_anchor = rebuf_ready + 0.08
                     self.stall_count += 1
-                elif (pts + safe_dur) - cur_playhead > max(28.0, safe_dur * 5.5):
-                    target_buf = min(12.0, max(3.5, safe_dur * 2.2))
-                    self.pts_anchor = (pts + safe_dur) - target_buf
-                    self.wall_anchor = done_wall
+                elif cur_at_done > (pts + safe_dur) - 0.08:
+                    self.pts_anchor = pts
+                    self.wall_anchor = done_wall + 0.08 - safe_dur
+                    self.stall_count += 1
+                elif not self.in_startup_burst:
+                    max_live_buf = max(14.0, self.startup_burst_dur + safe_dur * 1.15)
+                    if (pts + safe_dur) - cur_at_done > max_live_buf:
+                        target_buf = min(max_live_buf - 0.5, max(3.5, self.startup_burst_dur))
+                        self.pts_anchor = (pts + safe_dur) - target_buf
+                        self.wall_anchor = done_wall
 
         self.last_seq = seq
         self.last_pts = pts
@@ -921,11 +1007,16 @@ class AudioSidecarManager:
         # Closed-loop HLS PTS synchronization state
         self.timeline_clock = HlsTimelineClock()
         self._client_playheads: dict[str, ClientPlayheadTracker] = {}
+        self._opened_ffmpeg_urls: List[str] = []
         self._audio_origin_pts: Optional[float] = None
         self._audio_origin_locked: bool = False
+        self._tap_touch_wall: float = 0.0
         self._tap_first_sample_wall: float = 0.0
         self._tap_last_chunk_wall: float = 0.0
         self._tap_audio_fed_sec: float = 0.0
+        self._last_delivered_onset: float = -1e9
+        self._last_speech_end_pts: Optional[float] = None
+        self._detected_seg_dur: float = 4.0
 
         self.total_subtitles_emitted: int = 0
         self.recent_subtitles: List[dict] = []
@@ -944,6 +1035,34 @@ class AudioSidecarManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._watchdog_task: Optional[asyncio.Task] = None
 
+    def try_calibrate_origin(self) -> Optional[float]:
+        """
+        Locks `_audio_origin_pts` from the ordered list of media segments opened by FFmpeg (`_opened_ffmpeg_urls`).
+        Because FFmpeg pre-opens 1-2 segments during probing before `audio_fed_sec > 0`, retroactive
+        calibration when a later segment (or cross-variant TV manifest) enters `timeline_clock` computes
+        `origin = meta.start_pts - sum(prior_opened_durations)` with 0ms offset error!
+        """
+        with self._lock:
+            if self._audio_origin_locked and self._audio_origin_pts is not None:
+                return self._audio_origin_pts
+            urls = list(self._opened_ffmpeg_urls)
+            fallback_dur = max(0.5, self._detected_seg_dur or 4.0)
+        if not urls:
+            return None
+        metas = [self.timeline_clock.lookup_segment(u) for u in urls]
+        for idx, meta in enumerate(metas):
+            if meta is not None:
+                prior_dur = sum(
+                    (metas[j].duration if metas[j] is not None else fallback_dur)
+                    for j in range(idx)
+                )
+                origin = round(meta.start_pts - prior_dur, 3)
+                with self._lock:
+                    self._audio_origin_pts = origin
+                    self._audio_origin_locked = True
+                return origin
+        return None
+
     def record_client_segment(
         self,
         client_key: str,
@@ -951,6 +1070,7 @@ class AudioSidecarManager:
         dur: float,
         seq: int = -1,
         done_wall: Optional[float] = None,
+        start_wall: Optional[float] = None,
     ) -> ClientPlayheadTracker:
         ts = done_wall if done_wall is not None else time.time()
         with self._lock:
@@ -959,7 +1079,9 @@ class AudioSidecarManager:
             if tracker is None:
                 tracker = ClientPlayheadTracker(client_key=client_key)
                 self._client_playheads[client_key] = tracker
-            tracker.on_segment_delivered(pts=pts, dur=dur, seq=seq, done_wall=ts)
+            tracker.on_segment_delivered(
+                pts=pts, dur=dur, seq=seq, done_wall=ts, start_wall=start_wall
+            )
             return tracker
 
     def remove_client_playhead(self, client_key: str) -> None:
@@ -1015,6 +1137,7 @@ class AudioSidecarManager:
             new_ch_key = canonical_channel_key(channel_name, channel_id)
             old_worker = self._worker_thread
             self._stop_worker_locked()
+            self._tap_touch_wall = now
             session_epoch = self._session_epoch
             self.active_channel_id = channel_id
             self.active_channel_name = channel_name or "Live Channel"
@@ -1085,11 +1208,15 @@ class AudioSidecarManager:
         self._stop_event.set()
         self._last_subtitle_payload = None
         self._last_subtitle_content_ts = 0.0
+        self._opened_ffmpeg_urls = []
         self._audio_origin_pts = None
         self._audio_origin_locked = False
+        self._tap_touch_wall = 0.0
         self._tap_first_sample_wall = 0.0
         self._tap_last_chunk_wall = 0.0
         self._tap_audio_fed_sec = 0.0
+        self._last_delivered_onset = -1e9
+        self._last_speech_end_pts = None
         try:
             self._translate_queue.put_nowait(None)
         except queue.Full:
@@ -1101,14 +1228,14 @@ class AudioSidecarManager:
     def update_hls_manifest_metrics_from_seg_dur(self, seg_dur: float) -> None:
         """
         Calculates fallback stream lead (ms) before closed-loop `/seg/` playhead calibration kicks in:
-        - Short segments (< 4.5s) use M3U8 tail hold-back targeting ~9.5s lead.
-        - Long segments (>= 4.5s, e.g. Al Jazeera 6s/10s) start FFmpeg at -live_start_index -2
-          while TV players start around -3 (~1.2x segment duration lead).
+        - FFmpeg always taps `-live_start_index -1` (~1 segment behind live edge).
+        - TV manifests use `target_lead_sec=12.8` + `#EXT-X-START` (~2-3 segments behind live edge).
         """
-        if seg_dur >= 4.5:
-            estimated_lead = int(round(seg_dur * 1200.0))
+        self._detected_seg_dur = max(0.5, float(seg_dur))
+        if seg_dur >= 7.5:
+            estimated_lead = int(round(seg_dur * 1050.0))
         else:
-            estimated_lead = int(round(max(4500.0, seg_dur * 2200.0)))
+            estimated_lead = int(round(max(8000.0, min(13500.0, 12800.0 - seg_dur * 350.0))))
         self.auto_stream_lead_ms = max(2800, min(20000, estimated_lead))
 
     def update_hls_manifest_metrics(self, manifest_text: str) -> None:
@@ -1166,6 +1293,7 @@ class AudioSidecarManager:
             keepalive_payload: Optional[dict] = None
             keepalive_epoch: int = -1
             per_client_keepalives: List[tuple[str, dict]] = []
+            per_client_clears: List[str] = []
             calibrated_keys: set[str] = set()
             send_clear = False
             now = time.time()
@@ -1194,11 +1322,24 @@ class AudioSidecarManager:
                             if tr.is_fresh(now):
                                 calibrated_keys.add(ck)
                                 if (
+                                    self._audio_origin_pts is not None
+                                    and tr.last_speech_end_pts is not None
+                                    and not tr.cleared_after_speech
+                                    and tr.predict_playhead_pts(now) > tr.last_speech_end_pts + 6.5
+                                    and (now - tr.last_delivered_ts) >= 4.5
+                                ):
+                                    tr.cleared_after_speech = True
+                                    tr.last_delivered_payload = None
+                                    tr.last_broadcast_ts = now
+                                    per_client_clears.append(ck)
+                                elif (
                                     tr.last_delivered_payload is not None
                                     and (now - tr.last_broadcast_ts) >= 4.0
                                     and (now - tr.last_delivered_ts) <= 38.0
                                 ):
-                                    per_client_keepalives.append((ck, dict(tr.last_delivered_payload)))
+                                    cp = dict(tr.last_delivered_payload)
+                                    cp["keepalive"] = True
+                                    per_client_keepalives.append((ck, cp))
                                     tr.last_broadcast_ts = now
 
                     if self._last_subtitle_payload is not None:
@@ -1207,6 +1348,7 @@ class AudioSidecarManager:
                             and (now - self._last_subtitle_content_ts) <= 38.0
                         ):
                             keepalive_payload = dict(self._last_subtitle_payload)
+                            keepalive_payload["keepalive"] = True
                             self._last_broadcast_ts = now
 
             if send_clear:
@@ -1221,6 +1363,8 @@ class AudioSidecarManager:
                     still_valid = self._session_epoch == keepalive_epoch
                 if still_valid:
                     if self.send_client_cb is not None:
+                        for ck in per_client_clears:
+                            await self.send_client_cb(ck, {"type": "clear"})
                         for ck, cp in per_client_keepalives:
                             await self.send_client_cb(ck, cp)
                     if keepalive_payload is not None:
@@ -1304,8 +1448,9 @@ class AudioSidecarManager:
                 raw_url = candidates[cand_idx % len(candidates)]
                 cand_idx += 1
                 is_http = raw_url.lower().startswith(("http://", "https://"))
+                resolved_m3u8 = ""
                 if is_http:
-                    target_url, detected_seg_dur = resolve_best_audio_stream_info(
+                    target_url, detected_seg_dur, resolved_m3u8 = resolve_best_audio_stream_detail(
                         raw_url, stream_proxy=self.stream_proxy
                     )
                     if detected_seg_dur is not None:
@@ -1313,42 +1458,55 @@ class AudioSidecarManager:
                 else:
                     target_url, detected_seg_dur = raw_url, None
                 is_hls = ".m3u8" in target_url.lower() or ".m3u8" in raw_url.lower()
-                start_idx = "-2" if (detected_seg_dur and detected_seg_dur >= 4.5) else "-1"
+                start_idx = "-1"
 
-                # Reset 16kHz PCM sample cursor for this FFmpeg spawn and pre-ingest audio M3U8 into timeline_clock
+                # Reset 16kHz PCM sample cursor for this FFmpeg spawn and ingest audio M3U8 into timeline_clock
+                # directly from `resolved_m3u8` (zero extra cross-border TLS handshakes!)
                 self.pipeline.reset_audio_clock()
                 provisional_origin_pts: Optional[float] = None
                 if is_hls and is_http:
-                    try:
-                        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"}
-                        c_opts: dict = {"follow_redirects": True, "timeout": 3.5, "verify": False}
-                        if self.stream_proxy:
-                            c_opts["proxy"] = self.stream_proxy
-                        with httpx.Client(**c_opts) as hc:
-                            r_m = hc.get(target_url, headers=hdrs)
-                            if r_m.status_code < 400 and "#EXTINF" in r_m.text.upper():
-                                target_url = str(r_m.url)
-                                segs = self.timeline_clock.ingest_manifest(target_url, r_m.text)
-                                if detected_seg_dur is None:
-                                    detected_seg_dur = extract_hls_segment_duration(r_m.text)
-                                    if detected_seg_dur is not None:
-                                        self.update_hls_manifest_metrics_from_seg_dur(detected_seg_dur)
-                                        start_idx = "-2" if detected_seg_dur >= 4.5 else "-1"
-                                provisional_origin_pts = self.timeline_clock.expected_ffmpeg_start_pts(
-                                    segs, int(start_idx)
-                                )
-                    except Exception:
-                        pass
+                    if resolved_m3u8 and "#EXTINF" in resolved_m3u8.upper():
+                        segs = self.timeline_clock.ingest_manifest(target_url, resolved_m3u8)
+                        if detected_seg_dur is None:
+                            detected_seg_dur = extract_hls_segment_duration(resolved_m3u8)
+                            if detected_seg_dur is not None:
+                                self.update_hls_manifest_metrics_from_seg_dur(detected_seg_dur)
+                        provisional_origin_pts = self.timeline_clock.expected_ffmpeg_start_pts(
+                            segs, int(start_idx)
+                        )
+                    else:
+                        try:
+                            hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"}
+                            c_opts: dict = {"follow_redirects": True, "timeout": 6.0, "verify": False}
+                            if self.stream_proxy:
+                                c_opts["proxy"] = self.stream_proxy
+                            with httpx.Client(**c_opts) as hc:
+                                r_m = hc.get(target_url, headers=hdrs)
+                                if r_m.status_code < 400 and "#EXTINF" in r_m.text.upper():
+                                    target_url = str(r_m.url)
+                                    segs = self.timeline_clock.ingest_manifest(target_url, r_m.text)
+                                    if detected_seg_dur is None:
+                                        detected_seg_dur = extract_hls_segment_duration(r_m.text)
+                                        if detected_seg_dur is not None:
+                                            self.update_hls_manifest_metrics_from_seg_dur(detected_seg_dur)
+                                    provisional_origin_pts = self.timeline_clock.expected_ffmpeg_start_pts(
+                                        segs, int(start_idx)
+                                    )
+                        except Exception:
+                            pass
 
                 with self._lock:
                     if ev_stop.is_set():
                         return
                     self.active_upstream_url = target_url
+                    self._opened_ffmpeg_urls = []
                     self._audio_origin_pts = provisional_origin_pts
                     self._audio_origin_locked = False
                     self._tap_first_sample_wall = 0.0
                     self._tap_last_chunk_wall = 0.0
                     self._tap_audio_fed_sec = 0.0
+                    self._last_delivered_onset = -1e9
+                    self._last_speech_end_pts = None
 
                 cmd = [
                     ffmpeg_bin,
@@ -1412,9 +1570,8 @@ class AudioSidecarManager:
                         self._ffmpeg_proc = proc
 
                     chunk_size = 3200  # 100ms of 16kHz 16-bit mono PCM (32000 bytes/sec)
-                    if is_hls and detected_seg_dur:
-                        avail_cdn_sec = detected_seg_dur * (2.0 if start_idx == "-2" else 1.0)
-                        lookahead_sec = min(8.0, max(3.5, avail_cdn_sec * 0.80))
+                    if is_hls:
+                        lookahead_sec = max(12.5, (detected_seg_dur or 4.0) * 1.4)
                     else:
                         lookahead_sec = 3.5
                     stall_timeout_sec = max(8.5, (detected_seg_dur or 4.0) * 1.6)
@@ -1434,16 +1591,12 @@ class AudioSidecarManager:
                             m3u8_url: str = target_url,
                             stop_ev: threading.Event = ev_stop,
                         ) -> None:
-                            locked_first = False
-                            refreshed_once = False
+                            last_refresh_mono = 0.0
                             try:
                                 while not stop_ev.is_set():
                                     raw_b = epipe.readline()
                                     if not raw_b:
                                         break
-                                    if locked_first:
-                                        # Keep draining stderr until EOF so pipe buffer never blocks FFmpeg
-                                        continue
                                     line_s = raw_b.decode("utf-8", errors="ignore")
                                     m_open = _HLS_OPENING_RE.search(line_s)
                                     if not m_open:
@@ -1452,25 +1605,30 @@ class AudioSidecarManager:
                                     low_u = opened_u.split("?")[0].lower()
                                     if low_u.endswith(".m3u8") or self.timeline_clock.is_init_segment(opened_u):
                                         continue
-                                    pts = self.timeline_clock.lookup_segment_pts(opened_u)
-                                    if pts is None and not refreshed_once and is_http:
-                                        refreshed_once = True
+                                    with self._lock:
+                                        if len(self._opened_ffmpeg_urls) < 48:
+                                            self._opened_ffmpeg_urls.append(opened_u)
+                                        already_locked = self._audio_origin_locked
+                                    if already_locked:
+                                        continue
+                                    origin = self.try_calibrate_origin()
+                                    now_m = time.monotonic()
+                                    if origin is None and is_http and (now_m - last_refresh_mono) >= 4.5:
+                                        last_refresh_mono = now_m
                                         try:
-                                            c_o: dict = {"follow_redirects": True, "timeout": 2.5, "verify": False}
+                                            hdrs2 = {
+                                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"
+                                            }
+                                            c_o: dict = {"follow_redirects": True, "timeout": 5.5, "verify": False}
                                             if self.stream_proxy:
                                                 c_o["proxy"] = self.stream_proxy
                                             with httpx.Client(**c_o) as hc2:
-                                                r2 = hc2.get(m3u8_url)
+                                                r2 = hc2.get(m3u8_url, headers=hdrs2)
                                                 if r2.status_code < 400 and "#EXTINF" in r2.text.upper():
                                                     self.timeline_clock.ingest_manifest(str(r2.url), r2.text)
-                                                    pts = self.timeline_clock.lookup_segment_pts(opened_u)
+                                                    self.try_calibrate_origin()
                                         except Exception:
                                             pass
-                                    if pts is not None:
-                                        with self._lock:
-                                            self._audio_origin_pts = pts
-                                            self._audio_origin_locked = True
-                                        locked_first = True
                             except Exception:
                                 pass
 
@@ -1634,6 +1792,7 @@ class AudioSidecarManager:
             disp_mode = self.display_mode
             f_scale = self.font_scale
             origin_pts = self._audio_origin_pts
+            tap_touch_wall = self._tap_touch_wall
             tap_first_wall = self._tap_first_sample_wall
             tap_last_wall = self._tap_last_chunk_wall
             tap_fed_sec = self._tap_audio_fed_sec
@@ -1645,6 +1804,11 @@ class AudioSidecarManager:
                 and tr.is_fresh(now_wall)
             ]
 
+        speech_end_pts: Optional[float] = (
+            (origin_pts + ev.audio_end_sec)
+            if (origin_pts is not None and ev.audio_end_sec is not None)
+            else None
+        )
         fine_tune_ms = max(-5000, min(8000, sub_delay - 800))
         per_client_schedules: List[tuple[str, int, int]] = []
         sync_mode = "manual"
@@ -1678,9 +1842,15 @@ class AudioSidecarManager:
                     if tap_last_wall > 0.0
                     else tap_first_wall
                 )
+                probe_lag = (
+                    min(5.0, max(0.0, tap_first_wall - tap_touch_wall))
+                    if tap_touch_wall > 0.0
+                    else 0.0
+                )
+                adj_lead_sec = max(1.5, (lead_ms / 1000.0) - probe_lag)
                 target_wall = (
                     tap_base_wall
-                    + (lead_ms / 1000.0)
+                    + adj_lead_sec
                     + ev.audio_onset_sec
                     + (fine_tune_ms / 1000.0)
                 )
@@ -1730,16 +1900,21 @@ class AudioSidecarManager:
                     payload=_make_payload(c_delay, c_lead),
                     delay_ms=c_delay,
                     session_epoch=session_epoch,
+                    speech_end_pts=speech_end_pts,
                 )
             self._schedule_broadcast(
                 default_payload,
                 delay_ms=effective_delay_ms,
                 session_epoch=session_epoch,
                 exclude_clients=calibrated_keys,
+                speech_end_pts=speech_end_pts,
             )
         else:
             self._schedule_broadcast(
-                default_payload, delay_ms=effective_delay_ms, session_epoch=session_epoch
+                default_payload,
+                delay_ms=effective_delay_ms,
+                session_epoch=session_epoch,
+                speech_end_pts=speech_end_pts,
             )
 
     def _schedule_client_delivery(
@@ -1748,6 +1923,7 @@ class AudioSidecarManager:
         payload: dict,
         delay_ms: int,
         session_epoch: Optional[int] = None,
+        speech_end_pts: Optional[float] = None,
     ) -> None:
         if self._loop is None or self._loop.is_closed() or self.send_client_cb is None:
             return
@@ -1766,6 +1942,19 @@ class AudioSidecarManager:
                     return
                 tr = self._client_playheads.get(client_key)
                 if tr is not None and payload.get("type") == "subtitle":
+                    p_onset = payload.get("audio_onset_sec")
+                    if p_onset is not None:
+                        p_onset_f = float(p_onset)
+                        if p_onset_f < tr.last_delivered_onset - 0.05:
+                            return
+                        tr.last_delivered_onset = max(tr.last_delivered_onset, p_onset_f)
+                    tr.cleared_after_speech = False
+                    if speech_end_pts is not None:
+                        tr.last_speech_end_pts = (
+                            speech_end_pts
+                            if tr.last_speech_end_pts is None
+                            else max(tr.last_speech_end_pts, speech_end_pts)
+                        )
                     tr.last_delivered_payload = payload
                     tr.last_delivered_ts = now
                     tr.last_broadcast_ts = now
@@ -1779,6 +1968,7 @@ class AudioSidecarManager:
         delay_ms: int,
         session_epoch: Optional[int] = None,
         exclude_clients: Optional[set[str]] = None,
+        speech_end_pts: Optional[float] = None,
     ) -> None:
         if self._loop is None or self._loop.is_closed():
             return
@@ -1795,10 +1985,22 @@ class AudioSidecarManager:
             with self._lock:
                 if session_epoch is not None and session_epoch != self._session_epoch:
                     return
-                self._last_broadcast_ts = now
                 if payload.get("type") == "subtitle":
+                    p_onset = payload.get("audio_onset_sec")
+                    if p_onset is not None:
+                        p_onset_f = float(p_onset)
+                        if p_onset_f < self._last_delivered_onset - 0.05:
+                            return
+                        self._last_delivered_onset = max(self._last_delivered_onset, p_onset_f)
+                    if speech_end_pts is not None:
+                        self._last_speech_end_pts = (
+                            speech_end_pts
+                            if self._last_speech_end_pts is None
+                            else max(self._last_speech_end_pts, speech_end_pts)
+                        )
                     self._last_subtitle_payload = payload
                     self._last_subtitle_content_ts = now
+                self._last_broadcast_ts = now
             if excl and self.broadcast_ex_cb is not None:
                 await self.broadcast_ex_cb(payload, excl)
             else:
@@ -1951,7 +2153,11 @@ class MultiSessionSidecarPool:
             viewers = set(entry.viewers)
             manual_pinned = entry.sidecar.manual_pinned
             active_cnt = sum(1 for e in self._sessions.values() if e.sidecar.get_status().active)
-            if msg.get("type") == "subtitle" and msg.get("is_final", True):
+            if (
+                msg.get("type") == "subtitle"
+                and msg.get("is_final", True)
+                and not msg.get("keepalive")
+            ):
                 self.recent_subtitles.append(msg)
                 if len(self.recent_subtitles) > 80:
                     self.recent_subtitles = self.recent_subtitles[-80:]
@@ -2194,8 +2400,10 @@ class MultiSessionSidecarPool:
     ) -> tuple[str, Optional[HlsTimelineClock]]:
         """
         1) Ingests the untrimmed upstream Media M3U8 into the channel session's `HlsTimelineClock`
-           so both held-back TV segments and live-edge FFmpeg segments share an exact PTS mapping.
-        2) Applies adaptive M3U8 tail hold-back (`target_lead_sec=9.5`) when `auto_sync` is enabled.
+           so both held-back TV segments and live-edge FFmpeg segments share an exact PTS mapping,
+           and immediately attempts retroactive `try_calibrate_origin()` across variants!
+        2) Applies adaptive M3U8 tail hold-back (`target_lead_sec=12.8`) + `#EXT-X-START:PRECISE=NO`
+           when `auto_sync` is enabled.
         """
         if "#EXTINF" not in manifest_text.upper():
             return manifest_text, None
@@ -2209,9 +2417,12 @@ class MultiSessionSidecarPool:
         if sc is not None:
             clock = sc.timeline_clock
             clock.ingest_manifest(final_url, manifest_text)
+            sc.try_calibrate_origin()
 
         if use_holdback:
-            held_text, held_k = apply_m3u8_holdback(manifest_text, target_lead_sec=9.5)
+            held_text, held_k = apply_m3u8_holdback(
+                manifest_text, target_lead_sec=12.8, inject_start_tag=True
+            )
             if sc is not None:
                 sc.holdback_segments = held_k
             return held_text, clock
@@ -2231,6 +2442,7 @@ class MultiSessionSidecarPool:
         dur: Optional[float],
         seq: int = -1,
         done_wall: Optional[float] = None,
+        start_wall: Optional[float] = None,
     ) -> None:
         ts = done_wall if done_wall is not None else time.time()
         sc: Optional[AudioSidecarManager] = None
@@ -2249,7 +2461,12 @@ class MultiSessionSidecarPool:
         if sc is not None:
             if pts is not None and dur is not None and dur > 0:
                 sc.record_client_segment(
-                    client_key=client_key, pts=pts, dur=dur, seq=seq, done_wall=ts
+                    client_key=client_key,
+                    pts=pts,
+                    dur=dur,
+                    seq=seq,
+                    done_wall=ts,
+                    start_wall=start_wall,
                 )
             else:
                 with sc._lock:

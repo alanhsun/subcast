@@ -785,3 +785,163 @@ aud_11.aac?sig=ffY
             pool.stop_current()
             asyncio.run(mock_async_client.aclose())
 
+
+def test_cross_variant_pts_lock_progressive_playhead_and_monotonic_onset() -> None:
+    import asyncio
+    import time
+    from unittest.mock import patch
+
+    from server.ai_pipeline import SubtitleEvent
+    from server.main import get_sidecar
+    from server.stream_proxy import (
+        AudioSidecarManager,
+        ClientPlayheadTracker,
+        HlsTimelineClock,
+        apply_m3u8_holdback,
+    )
+
+    # 1. Cross-variant sequence lookup (Al Jazeera `01_246199106.ts` <-> `05_246199106.ts` with PDT)
+    aje_clock = HlsTimelineClock()
+    aje_tv_01 = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:246199104
+#EXT-X-PROGRAM-DATE-TIME:2026-11-15T14:00:00.000Z
+#EXTINF:6.000,
+01_246199104.ts
+#EXTINF:6.000,
+01_246199105.ts
+#EXTINF:6.000,
+01_246199106.ts
+#EXTINF:6.000,
+01_246199107.ts
+#EXTINF:6.000,
+01_246199108.ts
+#EXTINF:6.000,
+01_246199109.ts
+"""
+    metas_01 = aje_clock.ingest_manifest("https://live-hls-apps-aje-fa.getaj.net/AJE/01.m3u8", aje_tv_01)
+    pts_from_05 = aje_clock.lookup_segment_pts(
+        "https://live-hls-apps-aje-fa.getaj.net/AJE/05_246199106.ts"
+    )
+    assert pts_from_05 is not None
+    assert abs(pts_from_05 - metas_01[2].start_pts) < 0.001
+
+    # 2. 6s segment holdback + deterministic `#EXT-X-START:TIME-OFFSET=...,PRECISE=NO`
+    held_aje_6s, held_k_6s = apply_m3u8_holdback(
+        aje_tv_01, target_lead_sec=12.8, inject_start_tag=True
+    )
+    assert held_k_6s == 1
+    assert "01_246199109.ts" not in held_aje_6s
+    assert "01_246199108.ts" in held_aje_6s
+    assert "#EXT-X-START:TIME-OFFSET=-11.1,PRECISE=NO" in held_aje_6s
+
+    # 3. Progressive `[start_wall, done_wall]` playhead calibration avoids slow-download EOF bias
+    tr_prog = ClientPlayheadTracker(client_key="tag:tv_prog")
+    # 10.0s segment starts arriving at t=1000.0, finishes 4.0s later at t=1004.0 ->
+    # 2.2s playback buffer is ready at 1000.0 + 4.0 * (2.2 / 10.0) = 1000.88 (wall_anchor = 1001.00)
+    tr_prog.on_segment_delivered(
+        pts=200.0, dur=10.0, seq=50, done_wall=1004.0, start_wall=1000.0
+    )
+    assert abs(tr_prog.predict_wall_time(205.0) - 1006.00) < 0.05
+
+    # 4. Retroactive multi-segment `try_calibrate_origin()` (Bloomberg `BP-HD-7` pre-opens 2 segments before `BP-HD-4` M3U8)
+    #    + monotonic `audio_onset_sec` ordering + keepalive filtering
+    with (
+        patch.object(AudioSidecarManager, "_audio_tap_worker", lambda self, *a, **kw: time.sleep(0.8)),
+        patch.object(AudioSidecarManager, "_translation_worker", lambda self, *a, **kw: None),
+        TestClient(app) as client,
+    ):
+        pool = get_sidecar()
+        pool.stop_current()
+        pool.recent_subtitles.clear()
+        pool.apply_settings(subtitle_delay_ms=800, auto_sync=True)
+        try:
+            with client.websocket_connect("/tv1/ws/subtitles") as ws:
+                assert ws.receive_json()["type"] == "connected"
+                sc_btv = asyncio.run_coroutine_threadsafe(
+                    pool.touch_client_channel(
+                        client_key="tag:tv1",
+                        client_ip="10.10.10.55",
+                        client_tag="tv1",
+                        channel_id="btv_us",
+                        channel_name="Bloomberg TV",
+                        upstream_url="https://liveproduseast.akamaized.net/btv/us.m3u8",
+                    ),
+                    pool._loop,
+                ).result(timeout=5)
+                assert ws.receive_json()["type"] == "clear"
+
+                # Simulate FFmpeg opening 21695203.ts AND 21695204.ts on BP-HD-7 BEFORE TV fetches BP-HD-4
+                with sc_btv._lock:
+                    sc_btv._detected_seg_dur = 10.01
+                    sc_btv._opened_ffmpeg_urls = [
+                        "https://liveproduseast.akamaized.net/btv/BP-HD-7/21695203.ts",
+                        "https://liveproduseast.akamaized.net/btv/BP-HD-7/21695204.ts",
+                    ]
+                    assert sc_btv._audio_origin_pts is None
+
+                btv_tv_m3u8 = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:11
+#EXT-X-MEDIA-SEQUENCE:21695204
+#EXT-X-PROGRAM-DATE-TIME:2026-11-15T14:40:00.000Z
+#EXTINF:10.010,
+BP-HD-4/21695204.ts
+#EXTINF:10.010,
+BP-HD-4/21695205.ts
+#EXTINF:10.010,
+BP-HD-4/21695206.ts
+#EXTINF:10.010,
+BP-HD-4/21695207.ts
+"""
+                held_btv, btv_clock = pool.prepare_client_media_manifest(
+                    channel_id="btv_us",
+                    channel_name="Bloomberg TV",
+                    final_url="https://liveproduseast.akamaized.net/btv/BP-HD-4_live.m3u8",
+                    manifest_text=btv_tv_m3u8,
+                    client_key="tag:tv1",
+                )
+                assert "#EXT-X-START:TIME-OFFSET=-18.5,PRECISE=NO" in held_btv
+                assert btv_clock is not None
+                pts_204 = btv_clock.lookup_segment_pts(
+                    "https://liveproduseast.akamaized.net/btv/BP-HD-4/21695204.ts"
+                )
+                assert pts_204 is not None
+                # Retroactive calibration MUST subtract 1 prior opened segment (10.01s) from 21695204's start_pts!
+                assert sc_btv._audio_origin_locked is True
+                assert sc_btv._audio_origin_pts is not None
+                assert abs(sc_btv._audio_origin_pts - (pts_204 - 10.01)) < 0.02
+
+                # Verify monotonic onset guard: newer onset (5.0s) delivered first prevents stale onset (2.0s) overwrite
+                sc_btv.record_client_segment("tag:tv1", pts=pts_204 - 10.01, dur=10.01, seq=21695203)
+                sc_btv._schedule_client_delivery(
+                    "tag:tv1",
+                    {"type": "subtitle", "en": "Newer sentence.", "zh": "较新的句子。", "audio_onset_sec": 5.0},
+                    delay_ms=10,
+                    session_epoch=sc_btv._session_epoch,
+                )
+                sc_btv._schedule_client_delivery(
+                    "tag:tv1",
+                    {"type": "subtitle", "en": "Older slow sentence.", "zh": "较旧的慢句子。", "audio_onset_sec": 2.0},
+                    delay_ms=70,
+                    session_epoch=sc_btv._session_epoch,
+                )
+                time.sleep(0.14)
+                first_sub = ws.receive_json()
+                assert first_sub["zh"] == "较新的句子。"
+                assert sc_btv._client_playheads["tag:tv1"].last_delivered_payload["zh"] == "较新的句子。"
+
+                # Keepalive broadcasts must not duplicate entries in pool.recent_subtitles
+                asyncio.run_coroutine_threadsafe(
+                    pool._on_session_broadcast(
+                        "BLOOMBERG TV",
+                        {"type": "subtitle", "zh": "保活重发", "is_final": True, "keepalive": True},
+                    ),
+                    pool._loop,
+                ).result(timeout=3)
+                assert all(m.get("zh") != "保活重发" for m in pool.recent_subtitles)
+        finally:
+            pool.stop_current()
+
+

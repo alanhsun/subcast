@@ -407,6 +407,14 @@ class StreamingSpeechPipeline:
         "啊", "哦", "嗯", "呃", "哈", "噢", "呀", "诶", "唉", "喔",
         "啊有", "嗯嗯", "啊啊", "哦哦", "哈哈", "呃呃", "噢噢",
     }
+    _NON_SPLIT_ABBREVS = {
+        "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "mt", "gen", "sen", "rep", "gov",
+        "pres", "vs", "etc", "inc", "corp", "ltd", "co", "no", "vol", "fig", "dept", "est",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    }
+    _SENT_BOUNDARY_RE = re.compile(
+        r"([.?!][\"'”’)]?\s+(?=[\"'“‘(]?[A-Z\u00C0-\u00DE])|[。？！]+\s*)"
+    )
 
     def __init__(
         self,
@@ -710,11 +718,66 @@ class StreamingSpeechPipeline:
     def _get_mode_thresholds(self) -> Tuple[int, int, float, float]:
         """Returns (min_words, max_words, post_vad_silence_flush_sec, max_wait_sec)."""
         if self.sentence_mode == "paragraph":
-            return (18, 38, 0.75, 8.5)
+            return (16, 34, 0.70, 7.5)
         if self.sentence_mode == "fast_clause":
-            return (5, 16, 0.35, 3.2)
-        # Default: "full_sentence"
-        return (9, 28, 0.48, 5.5)
+            return (5, 15, 0.35, 3.0)
+        # Default: "full_sentence" — broadcast-crisp 1-2 line sentences without >10s hostage-holding
+        return (8, 24, 0.44, 4.4)
+
+    def _split_asr_into_clauses_with_samples(
+        self,
+        raw_text: str,
+        seg_start_sample: int,
+        seg_end_sample: int,
+    ) -> List[Tuple[str, int, int]]:
+        """
+        Splits a multi-sentence VAD chunk (e.g. "Difficult to predict where states will go. I mean, everyone thought...")
+        at genuine sentence boundaries while preserving abbreviations (U.S., Mr., Dr., etc.) and dangling words,
+        assigning word/unit-proportional 16kHz sample timestamps [sub_start, sub_end] to each sentence!
+        """
+        clean = " ".join(raw_text.strip().split())
+        if not clean:
+            return []
+
+        parts: List[str] = []
+        last_idx = 0
+        for m in self._SENT_BOUNDARY_RE.finditer(clean):
+            split_end = m.end()
+            prefix = clean[last_idx:split_end].strip()
+            if not prefix:
+                continue
+            # Check preceding Latin word before '.' so abbreviations & dangling words never split mid-clause
+            if "." in m.group(1):
+                wm = self._LAST_WORD_RE.search(prefix)
+                if wm:
+                    lw = wm.group(1)
+                    lw_low = lw.lower()
+                    if (
+                        len(lw) == 1
+                        or lw_low in self._NON_SPLIT_ABBREVS
+                        or lw_low in self._DANGLING_END_WORDS
+                    ):
+                        continue
+            parts.append(prefix)
+            last_idx = split_end
+
+        tail = clean[last_idx:].strip()
+        if tail:
+            parts.append(tail)
+        if len(parts) <= 1:
+            return [(clean, seg_start_sample, seg_end_sample)]
+
+        weights = [max(1, self._count_words_or_units(p)) for p in parts]
+        total_w = sum(weights)
+        span = max(0, seg_end_sample - seg_start_sample)
+        out: List[Tuple[str, int, int]] = []
+        cum_w = 0
+        for p, w in zip(parts, weights):
+            s0 = seg_start_sample + int(round(span * (cum_w / total_w)))
+            cum_w += w
+            s1 = seg_start_sample + int(round(span * (cum_w / total_w)))
+            out.append((p, s0, s1))
+        return out
 
     def _append_clause_to_pending(
         self,
@@ -726,6 +789,8 @@ class StreamingSpeechPipeline:
         clause = " ".join(raw_clause.strip().split())
         if not clause:
             return
+        # Remove consecutive ASR stutter duplicates (e.g. "when when presidents" -> "when presidents")
+        clause = re.sub(r"\b([A-Za-z]{2,})\s+\1\b", r"\1", clause, flags=re.IGNORECASE)
 
         if not self._pending_clauses:
             self._pending_first_ts = now
@@ -754,6 +819,18 @@ class StreamingSpeechPipeline:
                 ):
                     tokens[0] = first_tok[0].lower() + first_tok[1:]
                     clause = " ".join(tokens)
+
+                # Deduplicate cross-VAD-boundary single-word stutter (e.g. "...happens when" + "when the market...")
+                prev_last_tok = prev.rsplit(" ", 1)[-1].strip(" ,;:-—\"'()")
+                cur_parts = clause.split(" ", 1)
+                cur_first_clean = cur_parts[0].strip(" ,.?!;:-—\"'()")
+                if (
+                    len(cur_first_clean) >= 2
+                    and prev_last_tok.lower() == cur_first_clean.lower()
+                ):
+                    clause = cur_parts[1].strip() if len(cur_parts) > 1 else ""
+                    if not clause:
+                        return
 
         # If this clause ends on a dangling word (e.g. "announced that." or "going to."),
         # strip the false trailing period added by ASR so it merges seamlessly with the next segment.
@@ -790,14 +867,22 @@ class StreamingSpeechPipeline:
         # Measure actual stream audio elapsed rather than raw wall-clock so temporary network
         # jitter between HLS segments never triggers premature mid-sentence flushes.
         audio_wait_sec = self._pending_wait_samples / 16000.0
+        onset_span_sec = (
+            (self._stream_samples_cursor - self._pending_onset_sample) / 16000.0
+            if self._pending_onset_sample is not None
+            and self._stream_samples_cursor >= self._pending_onset_sample
+            else audio_wait_sec
+        )
         wall_wait_sec = (now - self._pending_first_ts) if self._pending_first_ts > 0 else 0.0
-        effective_max_words = (max_words + 8) if has_dangling else max_words
-        effective_max_wait = (max_wait_sec + 2.8) if has_dangling else max_wait_sec
+        effective_max_words = (max_words + 6) if has_dangling else max_words
+        effective_max_wait = (max_wait_sec + 2.2) if has_dangling else max_wait_sec
+        effective_max_span = effective_max_wait + 2.4
 
-        # 1. Hard cap on total words or stream audio waiting duration (with emergency wall-clock safety cap)
+        # 1. Hard cap on total words or stream audio span (prevents 14s multi-sentence hostage-holding)
         if (
             word_count >= effective_max_words
             or audio_wait_sec >= effective_max_wait
+            or onset_span_sec >= effective_max_span
             or (not is_currently_speaking and wall_wait_sec >= effective_max_wait + 6.0)
         ):
             return True
@@ -811,7 +896,7 @@ class StreamingSpeechPipeline:
             if is_complete and post_vad_silence_sec >= silence_flush_sec:
                 return True
             if not is_complete and post_vad_silence_sec >= (
-                silence_flush_sec + (1.35 if has_dangling else 0.85)
+                silence_flush_sec + (1.25 if has_dangling else 0.80)
             ):
                 return True
 
@@ -1014,20 +1099,25 @@ class StreamingSpeechPipeline:
                     if not src_text or len(src_text.strip(" .,?!。，？！")) < 2:
                         continue
 
-                    self._append_clause_to_pending(
-                        src_text,
-                        now,
-                        seg_start_sample=seg_start_sample,
-                        seg_end_sample=seg_end_sample,
+                    sub_clauses = self._split_asr_into_clauses_with_samples(
+                        src_text, seg_start_sample, seg_end_sample
                     )
-                    if self._should_flush_pending(
-                        now=now,
-                        is_currently_speaking=self.vad.is_speech_detected(),
-                        post_vad_silence_sec=0.0,
-                    ):
-                        ev = self._flush_pending_to_event()
-                        if ev is not None:
-                            events.append(ev)
+                    for sub_idx, (sub_text, sub_s0, sub_s1) in enumerate(sub_clauses):
+                        has_more_in_seg = sub_idx < (len(sub_clauses) - 1)
+                        self._append_clause_to_pending(
+                            sub_text,
+                            now,
+                            seg_start_sample=sub_s0,
+                            seg_end_sample=sub_s1,
+                        )
+                        if self._should_flush_pending(
+                            now=now,
+                            is_currently_speaking=(has_more_in_seg or self.vad.is_speech_detected()),
+                            post_vad_silence_sec=0.0,
+                        ):
+                            ev = self._flush_pending_to_event()
+                            if ev is not None:
+                                events.append(ev)
 
                 # 2. Check if buffered clauses should flush (by silence timeout OR max_wait_sec during continuous speech)
                 if self._pending_clauses:
@@ -1062,12 +1152,23 @@ class StreamingSpeechPipeline:
                     seg_start_sample = max(0, seg_end_sample - len(seg_samples))
                     src_text = self._recognize_sensevoice(seg_samples)
                     if src_text and len(src_text.strip(" .,?!。，？！")) >= 2:
-                        self._append_clause_to_pending(
-                            src_text,
-                            now,
-                            seg_start_sample=seg_start_sample,
-                            seg_end_sample=seg_end_sample,
+                        sub_clauses = self._split_asr_into_clauses_with_samples(
+                            src_text, seg_start_sample, seg_end_sample
                         )
+                        for sub_idx, (sub_text, sub_s0, sub_s1) in enumerate(sub_clauses):
+                            has_more = sub_idx < (len(sub_clauses) - 1)
+                            self._append_clause_to_pending(
+                                sub_text,
+                                now,
+                                seg_start_sample=sub_s0,
+                                seg_end_sample=sub_s1,
+                            )
+                            if has_more and self._should_flush_pending(
+                                now=now, is_currently_speaking=True, post_vad_silence_sec=0.0
+                            ):
+                                ev = self._flush_pending_to_event()
+                                if ev is not None:
+                                    events.append(ev)
                 if self._pending_clauses:
                     ev = self._flush_pending_to_event()
                     if ev is not None:

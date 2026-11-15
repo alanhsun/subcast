@@ -1152,6 +1152,7 @@ async def proxy_hls_segment(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid segment token: {exc}") from exc
 
+    req_start_wall = time.time()
     client_ip = _extract_client_ip(request)
     client_tag = sanitize_client_id(client)
     client_key = make_client_key(client_ip, client_tag)
@@ -1168,6 +1169,7 @@ async def proxy_hls_segment(
         if cached is not None:
             body, ctype = cached
             if not init:
+                done_now = time.time()
                 sidecar.record_client_segment(
                     client_key=client_key,
                     client_ip=client_ip,
@@ -1177,7 +1179,8 @@ async def proxy_hls_segment(
                     pts=pts,
                     dur=dur,
                     seq=seq,
-                    done_wall=time.time(),
+                    done_wall=done_now,
+                    start_wall=req_start_wall,
                 )
             return Response(
                 content=body,
@@ -1251,6 +1254,7 @@ async def proxy_hls_segment(
                         dur=dur,
                         seq=seq,
                         done_wall=time.time(),
+                        start_wall=req_start_wall,
                     )
 
     return StreamingResponse(
