@@ -329,3 +329,220 @@ http://1.2.3.4/cnn1.m3u8
             assert r_epg.status_code == 200
             payload = r_epg.json()
             assert len(payload["epg_data"]) > 0, f"Missing EPG for foreign channel: {query_ch}"
+
+
+def test_multi_client_playlist_and_manifest_tag_propagation() -> None:
+    sample = "BBC News,http://example.com/live/bbc.m3u8\nCCTV1,http://example.com/live/cctv1.m3u8\n"
+    entries = parse_playlist(sample)
+    m3u_tv2 = export_m3u(entries, "http://10.10.10.80:8765", client_id="tv2")
+    assert "&client=tv2" in m3u_tv2
+
+    rewritten = rewrite_m3u8_manifest(
+        manifest_text="#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1200000\nchunklist_720p.m3u8\n",
+        final_upstream_url="http://example.com/live/bbc.m3u8",
+        base_proxy_url="http://10.10.10.80:8765",
+        channel_id="bbc01",
+        channel_name="BBC News",
+        client_id="tv2",
+    )
+    assert "&client=tv2" in rewritten
+
+    with TestClient(app) as client:
+        r_tvbox = client.get("/tv2/tvbox.json")
+        assert r_tvbox.status_code == 200
+        lives = r_tvbox.json()["lives"]
+        assert lives[0]["url"].endswith("/tv2/playlist.m3u")
+
+        r_m3u = client.get("/tv2/playlist.m3u")
+        assert r_m3u.status_code == 200
+        assert "client=tv2" in r_m3u.text
+
+
+def test_multi_client_concurrent_isolation_and_same_channel_sharing() -> None:
+    import asyncio
+    from unittest.mock import patch
+
+    from server.ai_pipeline import SubtitleEvent
+    from server.main import get_sidecar
+    from server.stream_proxy import AudioSidecarManager
+
+    # Stub out actual FFmpeg subprocess spawning while keeping real pipeline cloning & WebSocket routing
+    with (
+        patch.object(AudioSidecarManager, "_audio_tap_worker", lambda self, *a, **kw: __import__("time").sleep(0.6)),
+        patch.object(AudioSidecarManager, "_translation_worker", lambda self, *a, **kw: None),
+        TestClient(app) as client,
+    ):
+        pool = get_sidecar()
+        pool.stop_current()
+        pool.auto_sync = False
+        pool.subtitle_delay_ms = 0
+
+        with (
+            client.websocket_connect("/tv1/ws/subtitles") as ws_tv1,
+            client.websocket_connect("/tv2/ws/subtitles") as ws_tv2,
+            client.websocket_connect("/ws/subtitles?role=console") as ws_console,
+        ):
+            conn1 = ws_tv1.receive_json()
+            conn2 = ws_tv2.receive_json()
+            conn_c = ws_console.receive_json()
+            assert conn1["client_key"] == "tag:tv1"
+            assert conn2["client_key"] == "tag:tv2"
+
+            # Per-TV display mode isolation: TV 1 switches to zh_only, TV 2 stays bilingual
+            ws_tv1.send_json({"action": "update_settings", "display_mode": "zh_only"})
+            ack1 = ws_tv1.receive_json()
+            assert ack1["type"] == "settings"
+            assert ack1["status"]["display_mode"] == "zh_only"
+
+            # TV 1 opens BBC News, TV 2 opens CNN International concurrently
+            async def _setup_two_channels():
+                sc_bbc = await pool.touch_client_channel(
+                    client_key="tag:tv1",
+                    client_ip="192.168.31.61",
+                    client_tag="tv1",
+                    channel_id="bbc_1",
+                    channel_name="BBC News (源1)",
+                    upstream_url="http://example.com/bbc1.m3u8",
+                )
+                sc_cnn = await pool.touch_client_channel(
+                    client_key="tag:tv2",
+                    client_ip="192.168.31.62",
+                    client_tag="tv2",
+                    channel_id="cnn_1",
+                    channel_name="CNN International",
+                    upstream_url="http://example.com/cnn1.m3u8",
+                )
+                return sc_bbc, sc_cnn
+
+            sc_bbc, sc_cnn = pool._loop.run_until_complete(_setup_two_channels()) if not pool._loop.is_running() else asyncio.run_coroutine_threadsafe(_setup_two_channels(), pool._loop).result(timeout=5)
+
+            # Drain initial clear messages sent on new channel start
+            assert ws_tv1.receive_json()["type"] == "clear"
+            assert ws_tv2.receive_json()["type"] == "clear"
+
+            # Verify isolated LLM context windows & shared ASR lock
+            assert sc_bbc is not sc_cnn
+            assert sc_bbc.pipeline._shared_asr_lock is sc_cnn.pipeline._shared_asr_lock
+            assert sc_bbc.pipeline.llm_translator.context_window is not sc_cnn.pipeline.llm_translator.context_window
+
+            sessions = pool.get_sessions_summary()
+            assert len(sessions) == 2
+
+            # Emit a BBC subtitle and a CNN subtitle simultaneously
+            sc_bbc._handle_subtitle_event(
+                SubtitleEvent(
+                    channel="BBC News",
+                    en="Good evening from London.",
+                    zh="伦敦晚上好。",
+                    is_final=True,
+                    timestamp=100.0,
+                    latency_ms=120.0,
+                ),
+                session_epoch=sc_bbc._session_epoch,
+            )
+            sc_cnn._handle_subtitle_event(
+                SubtitleEvent(
+                    channel="CNN International",
+                    en="Live from New York.",
+                    zh="纽约现场直播。",
+                    is_final=True,
+                    timestamp=101.0,
+                    latency_ms=130.0,
+                ),
+                session_epoch=sc_cnn._session_epoch,
+            )
+
+            msg_tv1 = ws_tv1.receive_json()
+            msg_tv2 = ws_tv2.receive_json()
+            assert msg_tv1["zh"] == "伦敦晚上好。"
+            assert msg_tv1["display_mode"] == "zh_only"  # TV 1 custom display_mode preserved!
+            assert msg_tv2["zh"] == "纽约现场直播。"
+            assert msg_tv2["display_mode"] == "bilingual"  # TV 2 unaffected by TV 1!
+
+            # Console receives BOTH subtitles
+            console_zhs = {ws_console.receive_json()["zh"], ws_console.receive_json()["zh"]}
+            assert console_zhs == {"伦敦晚上好。", "纽约现场直播。"}
+
+            # TV 3 opens BBC News (源2) -> must share existing BBC session (still 2 sessions total!)
+            with client.websocket_connect("/tv3/ws/subtitles") as ws_tv3:
+                _ = ws_tv3.receive_json()
+                sc_bbc_shared = asyncio.run_coroutine_threadsafe(
+                    pool.touch_client_channel(
+                        client_key="tag:tv3",
+                        client_ip="192.168.31.63",
+                        client_tag="tv3",
+                        channel_id="bbc_2",
+                        channel_name="BBC News (源2)",
+                        upstream_url="http://example.com/bbc2.m3u8",
+                    ),
+                    pool._loop,
+                ).result(timeout=5)
+                assert sc_bbc_shared is sc_bbc
+                assert len(pool.get_sessions_summary()) == 2
+                # TV 3 receives initial screen clear followed immediately by the replayed latest BBC subtitle!
+                assert ws_tv3.receive_json()["type"] == "clear"
+                replay_tv3 = ws_tv3.receive_json()
+                assert replay_tv3["zh"] == "伦敦晚上好。"
+
+                # TV 2 switches to domestic Chinese channel CCTV-1 -> clears ONLY TV 2 and closes CNN,
+                # while BBC session for TV 1 & TV 3 stays 100% active!
+                asyncio.run_coroutine_threadsafe(
+                    pool.mark_client_chinese_channel(
+                        client_key="tag:tv2",
+                        client_ip="192.168.31.62",
+                        client_tag="tv2",
+                        channel_name="CCTV-1综合",
+                    ),
+                    pool._loop,
+                ).result(timeout=5)
+                assert ws_tv2.receive_json()["type"] == "clear"
+                remaining = pool.get_sessions_summary()
+                assert len(remaining) == 1
+                assert remaining[0]["channel_key"] == "BBC NEWS"
+                assert remaining[0]["viewer_count"] == 2
+
+            pool.stop_current()
+
+        # Also verify zero-config automatic per-IP isolation (/ws/subtitles without tags)
+        with (
+            client.websocket_connect("/ws/subtitles", headers={"X-Forwarded-For": "192.168.31.71"}) as ws_ip1,
+            client.websocket_connect("/ws/subtitles", headers={"X-Forwarded-For": "192.168.31.72"}) as ws_ip2,
+        ):
+            assert ws_ip1.receive_json()["client_key"] == "ip:192.168.31.71"
+            assert ws_ip2.receive_json()["client_key"] == "ip:192.168.31.72"
+            sc_sky = asyncio.run_coroutine_threadsafe(
+                pool.touch_client_channel(
+                    client_key="ip:192.168.31.71",
+                    client_ip="192.168.31.71",
+                    client_tag="",
+                    channel_id="sky_1",
+                    channel_name="Sky News",
+                    upstream_url="http://example.com/sky.m3u8",
+                ),
+                pool._loop,
+            ).result(timeout=5)
+            asyncio.run_coroutine_threadsafe(
+                pool.mark_client_chinese_channel(
+                    client_key="ip:192.168.31.72",
+                    client_ip="192.168.31.72",
+                    client_tag="",
+                    channel_name="CCTV-13新闻",
+                ),
+                pool._loop,
+            ).result(timeout=5)
+            assert ws_ip1.receive_json()["type"] == "clear"
+            assert ws_ip2.receive_json()["type"] == "clear"
+
+            sc_sky._handle_subtitle_event(
+                SubtitleEvent(
+                    channel="Sky News",
+                    en="Breaking news from Westminster.",
+                    zh="来自威斯敏斯特的突发新闻。",
+                    is_final=True,
+                    timestamp=200.0,
+                    latency_ms=110.0,
+                ),
+                session_epoch=sc_sky._session_epoch,
+            )
+            assert ws_ip1.receive_json()["zh"] == "来自威斯敏斯特的突发新闻。"
+            pool.stop_current()

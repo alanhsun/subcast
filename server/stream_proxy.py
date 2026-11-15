@@ -15,14 +15,14 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import httpx
 
 from server.ai_pipeline import StreamingSpeechPipeline, SubtitleEvent
-from server.playlist_parser import encode_url_token
+from server.playlist_parser import encode_url_token, sanitize_client_id
 
 _URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)", re.IGNORECASE)
@@ -212,15 +212,18 @@ def rewrite_m3u8_manifest(
     channel_id: str,
     channel_name: str,
     proxy_segments: bool = False,
+    client_id: str = "",
 ) -> str:
     base = base_proxy_url.rstrip("/")
     encoded_name = quote(channel_name)
+    clean_cid = sanitize_client_id(client_id)
+    cid_param = f"&client={quote(clean_cid)}" if clean_cid else ""
     out_lines: List[str] = []
 
     def _wrap_proxy(target_url: str, is_playlist: bool) -> str:
         tok = encode_url_token(target_url)
         ext = "index.m3u8" if is_playlist else "stream.ts"
-        return f"{base}/live/{channel_id}/{ext}?u={tok}&name={encoded_name}"
+        return f"{base}/live/{channel_id}/{ext}?u={tok}&name={encoded_name}{cid_param}"
 
     lines = manifest_text.splitlines()
     expect_variant_playlist = False
@@ -378,10 +381,12 @@ class AudioSidecarManager:
         pipeline: StreamingSpeechPipeline,
         broadcast_cb: Callable[[dict], Awaitable[None]],
         idle_timeout_sec: float = 25.0,
+        on_idle_stop: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
         self.pipeline = pipeline
         self.broadcast_cb = broadcast_cb
         self.idle_timeout_sec = idle_timeout_sec
+        self.on_idle_stop = on_idle_stop
         self.stream_proxy: str = os.environ.get("LINGUARELAY_STREAM_PROXY", "").strip()
 
         self.active_channel_id: str = ""
@@ -427,6 +432,7 @@ class AudioSidecarManager:
         upstream_url: str,
         manual_pin: Optional[bool] = None,
         candidate_urls: Optional[List[str]] = None,
+        emit_clear: bool = True,
     ) -> None:
         now = time.time()
         old_worker: Optional[threading.Thread] = None
@@ -472,7 +478,8 @@ class AudioSidecarManager:
             self._translate_queue = session_queue
 
             # Clear any previous channel's subtitle on the TV screen immediately
-            self._schedule_broadcast({"type": "clear"}, delay_ms=0, session_epoch=None)
+            if emit_clear:
+                self._schedule_broadcast({"type": "clear"}, delay_ms=0, session_epoch=None)
 
             self._translate_thread = threading.Thread(
                 target=self._translation_worker,
@@ -510,6 +517,12 @@ class AudioSidecarManager:
             self.active_upstream_url = ""
             self.active_candidate_urls = []
             return was_active
+
+    def close(self) -> None:
+        """Stops FFmpeg/worker threads and cancels the per-session watchdog task."""
+        self.stop_current()
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
 
     def _stop_worker_locked(self) -> None:
         self._session_epoch += 1
@@ -611,6 +624,11 @@ class AudioSidecarManager:
 
             if send_clear:
                 await self.broadcast_cb({"type": "clear"})
+                if self.on_idle_stop is not None:
+                    try:
+                        await self.on_idle_stop()
+                    except Exception:
+                        pass
             elif keepalive_payload is not None:
                 with self._lock:
                     still_valid = self._session_epoch == keepalive_epoch
@@ -992,3 +1010,573 @@ class AudioSidecarManager:
             await self.broadcast_cb(payload)
 
         asyncio.run_coroutine_threadsafe(_delayed_send(), self._loop)
+
+
+def make_client_key(client_ip: str, client_id: str = "") -> str:
+    cid = sanitize_client_id(client_id)
+    if cid:
+        return f"tag:{cid}"
+    ip = (client_ip or "local").strip()
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+    return f"ip:{ip}"
+
+
+def canonical_channel_key(channel_name: str, channel_id: str = "") -> str:
+    base = re.sub(r"\s*[\(（]源\d+[\)）]$", "", (channel_name or "").strip()).strip()
+    if base and base.lower() not in ("live channel", "manual stream", "live stream"):
+        return base.upper()
+    return (channel_id or base or "MANUAL").upper()
+
+
+@dataclass
+class ClientBinding:
+    client_key: str
+    client_ip: str
+    client_tag: str
+    channel_key: str
+    channel_id: str
+    channel_name: str
+    need_translate: bool
+    last_seen: float
+
+
+@dataclass
+class ChannelSessionEntry:
+    channel_key: str
+    channel_id: str
+    channel_name: str
+    sidecar: AudioSidecarManager
+    viewers: set[str] = field(default_factory=set)
+    viewer_last_seen: dict[str, float] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+
+
+class MultiSessionSidecarPool:
+    """
+    Concurrent multi-client sidecar orchestrator (up to `max_sessions` independent foreign channels).
+    - Multiple clients watching the SAME foreign channel automatically share 1 FFmpeg + VAD + ASR + LLM session.
+    - Multiple clients watching DIFFERENT channels get isolated FFmpeg + Silero-VAD + 6-sentence LLM context
+      while sharing the read-only `Qwen3-ASR-0.6B-int8` model weights in memory.
+    - A client switching to a Chinese channel (`need_translate=False`) clears ONLY its own screen and never
+      stops other clients' active foreign sessions.
+    """
+
+    def __init__(
+        self,
+        pipeline: StreamingSpeechPipeline,
+        route_session_cb: Callable[[str, set[str], bool, int, dict], Awaitable[None]],
+        send_client_cb: Callable[[str, dict], Awaitable[None]],
+        broadcast_all_cb: Callable[[dict], Awaitable[None]],
+        max_sessions: Optional[int] = None,
+        idle_timeout_sec: float = 25.0,
+    ) -> None:
+        self.pipeline = pipeline
+        self.route_session_cb = route_session_cb
+        self.send_client_cb = send_client_cb
+        self.broadcast_all_cb = broadcast_all_cb
+        env_max = os.environ.get("LINGUARELAY_MAX_SESSIONS", "").strip()
+        default_max = int(env_max) if env_max.isdigit() and int(env_max) > 0 else 3
+        self.max_sessions: int = max(1, max_sessions if max_sessions is not None else default_max)
+        self.idle_timeout_sec: float = idle_timeout_sec
+        self.stream_proxy: str = os.environ.get("LINGUARELAY_STREAM_PROXY", "").strip()
+
+        # Shared default display & alignment settings
+        self.subtitle_delay_ms: int = 800
+        self.display_mode: str = "bilingual"
+        self.font_scale: float = 1.0
+        self.sentence_mode: str = "full_sentence"
+        self.auto_sync: bool = True
+
+        self.recent_subtitles: List[dict] = []
+        self._archived_subtitles_count: int = 0
+        self._sessions: dict[str, ChannelSessionEntry] = {}
+        self._client_bindings: dict[str, ClientBinding] = {}
+        self._lock = threading.RLock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._housekeeping_task: Optional[asyncio.Task] = None
+
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        with self._lock:
+            entries = list(self._sessions.values())
+        for entry in entries:
+            entry.sidecar.attach_loop(loop)
+        if self._housekeeping_task is None or self._housekeeping_task.done():
+            self._housekeeping_task = loop.create_task(self._pool_housekeeping_loop())
+
+    def close(self) -> None:
+        self.stop_current()
+        if self._housekeeping_task is not None and not self._housekeeping_task.done():
+            self._housekeeping_task.cancel()
+
+    def _sync_settings_to_sidecar(self, sc: AudioSidecarManager) -> None:
+        sc.subtitle_delay_ms = self.subtitle_delay_ms
+        sc.display_mode = self.display_mode
+        sc.font_scale = self.font_scale
+        sc.sentence_mode = self.sentence_mode
+        sc.pipeline.sentence_mode = self.sentence_mode
+        sc.auto_sync = self.auto_sync
+        sc.stream_proxy = self.stream_proxy
+
+    def apply_settings(
+        self,
+        subtitle_delay_ms: Optional[int] = None,
+        display_mode: Optional[str] = None,
+        font_scale: Optional[float] = None,
+        sentence_mode: Optional[str] = None,
+        auto_sync: Optional[bool] = None,
+    ) -> None:
+        with self._lock:
+            if subtitle_delay_ms is not None:
+                self.subtitle_delay_ms = subtitle_delay_ms
+            if display_mode in ("bilingual", "zh_only"):
+                self.display_mode = display_mode
+            if font_scale is not None:
+                self.font_scale = font_scale
+            if sentence_mode in ("full_sentence", "paragraph", "fast_clause"):
+                self.sentence_mode = sentence_mode
+                self.pipeline.sentence_mode = sentence_mode
+            if auto_sync is not None:
+                self.auto_sync = auto_sync
+            entries = list(self._sessions.values())
+        for entry in entries:
+            self._sync_settings_to_sidecar(entry.sidecar)
+
+    async def _on_session_broadcast(self, ch_key: str, msg: dict) -> None:
+        with self._lock:
+            entry = self._sessions.get(ch_key)
+            if entry is None:
+                return
+            viewers = set(entry.viewers)
+            manual_pinned = entry.sidecar.manual_pinned
+            active_cnt = sum(1 for e in self._sessions.values() if e.sidecar.get_status().active)
+            if msg.get("type") == "subtitle" and msg.get("is_final", True):
+                self.recent_subtitles.append(msg)
+                if len(self.recent_subtitles) > 80:
+                    self.recent_subtitles = self.recent_subtitles[-80:]
+        await self.route_session_cb(ch_key, viewers, manual_pinned, max(1, active_cnt), msg)
+
+    async def _on_session_idle_stop(self, ch_key: str) -> None:
+        with self._lock:
+            entry = self._sessions.pop(ch_key, None)
+            if entry is not None:
+                self._archived_subtitles_count += entry.sidecar.total_subtitles_emitted
+                entry.sidecar.close()
+
+    def _spawn_session_locked(
+        self,
+        ch_key: str,
+        channel_id: str,
+        channel_name: str,
+    ) -> ChannelSessionEntry:
+        sess_pipeline = self.pipeline.create_session_pipeline(channel_name=channel_name)
+        sc = AudioSidecarManager(
+            pipeline=sess_pipeline,
+            broadcast_cb=lambda msg, ck=ch_key: self._on_session_broadcast(ck, msg),
+            idle_timeout_sec=self.idle_timeout_sec,
+            on_idle_stop=lambda ck=ch_key: self._on_session_idle_stop(ck),
+        )
+        self._sync_settings_to_sidecar(sc)
+        if self._loop is not None:
+            sc.attach_loop(self._loop)
+        entry = ChannelSessionEntry(
+            channel_key=ch_key,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            sidecar=sc,
+        )
+        self._sessions[ch_key] = entry
+        return entry
+
+    def _evict_one_if_needed_locked(self, incoming_ch_key: str) -> tuple[Optional[ChannelSessionEntry], set[str]]:
+        # First reap any dead unpinned entries
+        dead_keys = [
+            k
+            for k, e in self._sessions.items()
+            if k != incoming_ch_key and not e.sidecar.get_status().active and not e.sidecar.manual_pinned
+        ]
+        for k in dead_keys:
+            dead = self._sessions.pop(k)
+            self._archived_subtitles_count += dead.sidecar.total_subtitles_emitted
+            dead.sidecar.close()
+
+        if incoming_ch_key in self._sessions or len(self._sessions) < self.max_sessions:
+            return None, set()
+
+        # Pick eviction victim: prefer unpinned with 0 viewers -> unpinned oldest touch -> oldest overall
+        candidates = [e for k, e in self._sessions.items() if k != incoming_ch_key]
+        if not candidates:
+            return None, set()
+        candidates.sort(
+            key=lambda e: (
+                1 if e.sidecar.manual_pinned else 0,
+                1 if len(e.viewers) > 0 else 0,
+                e.sidecar.last_touch_time,
+            )
+        )
+        victim = candidates[0]
+        self._sessions.pop(victim.channel_key, None)
+        self._archived_subtitles_count += victim.sidecar.total_subtitles_emitted
+        evicted_viewers = set(victim.viewers)
+        victim.sidecar.close()
+        return victim, evicted_viewers
+
+    async def touch_client_channel(
+        self,
+        client_key: str,
+        client_ip: str,
+        client_tag: str,
+        channel_id: str,
+        channel_name: str,
+        upstream_url: str,
+        candidate_urls: Optional[List[str]] = None,
+        manifest_text: str = "",
+    ) -> AudioSidecarManager:
+        now = time.time()
+        ch_key = canonical_channel_key(channel_name, channel_id)
+        send_clear_to_client = False
+        evicted_viewers: set[str] = set()
+        replay_payload: Optional[dict] = None
+
+        with self._lock:
+            prev = self._client_bindings.get(client_key)
+            self._client_bindings[client_key] = ClientBinding(
+                client_key=client_key,
+                client_ip=client_ip,
+                client_tag=client_tag,
+                channel_key=ch_key,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                need_translate=True,
+                last_seen=now,
+            )
+
+            if prev is not None and prev.channel_key and prev.channel_key != ch_key:
+                send_clear_to_client = True
+                old_entry = self._sessions.get(prev.channel_key)
+                if old_entry is not None:
+                    old_entry.viewers.discard(client_key)
+                    old_entry.viewer_last_seen.pop(client_key, None)
+                    if not old_entry.viewers and not old_entry.sidecar.manual_pinned:
+                        self._sessions.pop(prev.channel_key, None)
+                        self._archived_subtitles_count += old_entry.sidecar.total_subtitles_emitted
+                        old_entry.sidecar.close()
+
+            entry = self._sessions.get(ch_key)
+            is_existing = entry is not None and entry.sidecar.get_status().active
+            if entry is None:
+                _, evicted_viewers = self._evict_one_if_needed_locked(ch_key)
+                entry = self._spawn_session_locked(ch_key, channel_id, channel_name)
+                send_clear_to_client = True
+
+            was_new_viewer = client_key not in entry.viewers
+            if prev is None or prev.channel_key != ch_key:
+                send_clear_to_client = True
+            entry.viewers.add(client_key)
+            entry.viewer_last_seen[client_key] = now
+            other_viewers_active = is_existing and len(entry.viewers) > 1
+            if not other_viewers_active:
+                entry.channel_id = channel_id
+                entry.channel_name = channel_name
+            sc = entry.sidecar
+
+            if is_existing and was_new_viewer:
+                if sc._last_subtitle_payload and (now - sc._last_subtitle_content_ts) <= 35.0:
+                    replay_payload = dict(sc._last_subtitle_payload)
+                else:
+                    replay_payload = {
+                        "type": "status",
+                        "event": "channel_join",
+                        "channel": entry.channel_name,
+                        "en": f"Listening: {entry.channel_name}",
+                        "zh": f"声幕已接入频道：{entry.channel_name}",
+                        "is_final": True,
+                        "display_mode": self.display_mode,
+                    }
+
+        for ev_ck in evicted_viewers:
+            if ev_ck != client_key:
+                await self.send_client_cb(ev_ck, {"type": "clear"})
+        if send_clear_to_client:
+            await self.send_client_cb(client_key, {"type": "clear"})
+
+        if other_viewers_active:
+            with sc._lock:
+                sc.last_touch_time = time.time()
+        else:
+            if manifest_text:
+                sc.update_hls_manifest_metrics(manifest_text)
+            sc.touch_channel(
+                channel_id=channel_id,
+                channel_name=channel_name,
+                upstream_url=upstream_url,
+                candidate_urls=candidate_urls,
+                emit_clear=False,
+            )
+
+        if replay_payload is not None:
+            await self.send_client_cb(client_key, replay_payload)
+        return sc
+
+    async def mark_client_chinese_channel(
+        self,
+        client_key: str,
+        client_ip: str,
+        client_tag: str,
+        channel_name: str,
+    ) -> None:
+        now = time.time()
+        closed_last_session = False
+        with self._lock:
+            prev = self._client_bindings.get(client_key)
+            self._client_bindings[client_key] = ClientBinding(
+                client_key=client_key,
+                client_ip=client_ip,
+                client_tag=client_tag,
+                channel_key="",
+                channel_id="",
+                channel_name=channel_name,
+                need_translate=False,
+                last_seen=now,
+            )
+            if prev is not None and prev.channel_key:
+                old_entry = self._sessions.get(prev.channel_key)
+                if old_entry is not None:
+                    old_entry.viewers.discard(client_key)
+                    old_entry.viewer_last_seen.pop(client_key, None)
+                    if not old_entry.viewers and not old_entry.sidecar.manual_pinned:
+                        self._sessions.pop(prev.channel_key, None)
+                        self._archived_subtitles_count += old_entry.sidecar.total_subtitles_emitted
+                        old_entry.sidecar.close()
+                        if not self._sessions:
+                            closed_last_session = True
+
+        await self.send_client_cb(client_key, {"type": "clear"})
+        if closed_last_session:
+            await self.route_session_cb("", set(), False, 0, {"type": "clear"})
+
+    async def pin_channel(
+        self,
+        channel_id: str,
+        channel_name: str,
+        upstream_url: str,
+        candidate_urls: Optional[List[str]] = None,
+    ) -> SidecarStatus:
+        ch_key = canonical_channel_key(channel_name, channel_id)
+        evicted_viewers: set[str] = set()
+        with self._lock:
+            entry = self._sessions.get(ch_key)
+            if entry is None:
+                _, evicted_viewers = self._evict_one_if_needed_locked(ch_key)
+                entry = self._spawn_session_locked(ch_key, channel_id, channel_name)
+            entry.channel_id = channel_id
+            entry.channel_name = channel_name
+            sc = entry.sidecar
+
+        for ev_ck in evicted_viewers:
+            await self.send_client_cb(ev_ck, {"type": "clear"})
+        sc.touch_channel(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            upstream_url=upstream_url,
+            manual_pin=True,
+            candidate_urls=candidate_urls,
+        )
+        return self.get_status()
+
+    def set_client_delay(self, client_key: str, delay_ms: int) -> None:
+        with self._lock:
+            binding = self._client_bindings.get(client_key)
+            if binding and binding.channel_key and binding.channel_key in self._sessions:
+                self._sessions[binding.channel_key].sidecar.subtitle_delay_ms = delay_ms
+                if len(self._sessions) <= 1:
+                    self.subtitle_delay_ms = delay_ms
+            else:
+                self.subtitle_delay_ms = delay_ms
+                for e in self._sessions.values():
+                    e.sidecar.subtitle_delay_ms = delay_ms
+
+    def stop_session(self, channel_key: str = "") -> tuple[bool, set[str]]:
+        with self._lock:
+            if channel_key:
+                entry = self._sessions.pop(channel_key, None)
+                if entry is None:
+                    # Also allow matching by channel_id or channel_name
+                    for k, e in list(self._sessions.items()):
+                        if e.channel_id == channel_key or e.channel_name == channel_key:
+                            entry = self._sessions.pop(k)
+                            break
+                if entry is not None:
+                    viewers = set(entry.viewers)
+                    self._archived_subtitles_count += entry.sidecar.total_subtitles_emitted
+                    entry.sidecar.close()
+                    return True, viewers
+                return False, set()
+            all_viewers: set[str] = set()
+            for e in self._sessions.values():
+                all_viewers.update(e.viewers)
+            return self.stop_current(), all_viewers
+
+    def stop_current(self) -> bool:
+        with self._lock:
+            had_any = bool(self._sessions)
+            for entry in self._sessions.values():
+                self._archived_subtitles_count += entry.sidecar.total_subtitles_emitted
+                entry.sidecar.close()
+            self._sessions.clear()
+            return had_any
+
+    def get_client_binding(self, client_key: str, max_age_sec: float = 90.0) -> Optional[ClientBinding]:
+        now = time.time()
+        with self._lock:
+            b = self._client_bindings.get(client_key)
+            if b is not None and (now - b.last_seen) <= max_age_sec:
+                return b
+            return None
+
+    async def _pool_housekeeping_loop(self) -> None:
+        while True:
+            await asyncio.sleep(5.0)
+            now = time.time()
+            with self._lock:
+                # Expire stale viewer references inside sessions
+                for ck, entry in list(self._sessions.items()):
+                    stale_v = [
+                        vk
+                        for vk, ts in entry.viewer_last_seen.items()
+                        if (now - ts) > (self.idle_timeout_sec + 5.0)
+                    ]
+                    for vk in stale_v:
+                        entry.viewers.discard(vk)
+                        entry.viewer_last_seen.pop(vk, None)
+                    st = entry.sidecar.get_status()
+                    if not st.active and not entry.sidecar.manual_pinned:
+                        self._sessions.pop(ck, None)
+                        self._archived_subtitles_count += entry.sidecar.total_subtitles_emitted
+                        entry.sidecar.close()
+
+                # Expire old client bindings (> 120s inactive)
+                stale_cb = [
+                    ck for ck, b in self._client_bindings.items() if (now - b.last_seen) > 120.0
+                ]
+                for ck in stale_cb:
+                    self._client_bindings.pop(ck, None)
+
+    def get_sessions_summary(self) -> List[dict]:
+        now = time.time()
+        out: List[dict] = []
+        with self._lock:
+            entries = sorted(
+                self._sessions.values(),
+                key=lambda e: e.sidecar.last_touch_time,
+                reverse=True,
+            )
+            for e in entries:
+                st = e.sidecar.get_status()
+                if not st.active and not e.sidecar.manual_pinned:
+                    continue
+                out.append(
+                    {
+                        "channel_key": e.channel_key,
+                        "channel_id": st.channel_id or e.channel_id,
+                        "channel_name": st.channel_name or e.channel_name,
+                        "upstream_url": st.upstream_url,
+                        "manual_pinned": st.manual_pinned,
+                        "viewer_count": len(e.viewers),
+                        "viewers": sorted(e.viewers),
+                        "subtitles_emitted": st.total_subtitles_emitted,
+                        "auto_stream_lead_ms": st.auto_stream_lead_ms,
+                        "last_touch_ago_sec": round(max(0.0, now - e.sidecar.last_touch_time), 1)
+                        if e.sidecar.last_touch_time > 0
+                        else 0.0,
+                    }
+                )
+        return out
+
+    def get_clients_summary(self) -> List[dict]:
+        now = time.time()
+        out: List[dict] = []
+        with self._lock:
+            for b in sorted(self._client_bindings.values(), key=lambda x: x.last_seen, reverse=True):
+                age = now - b.last_seen
+                if age > 90.0:
+                    continue
+                out.append(
+                    {
+                        "client_key": b.client_key,
+                        "client_ip": b.client_ip,
+                        "client_tag": b.client_tag,
+                        "channel_name": b.channel_name,
+                        "need_translate": b.need_translate,
+                        "last_seen_ago_sec": round(max(0.0, age), 1),
+                    }
+                )
+        return out
+
+    def get_status(self) -> SidecarStatus:
+        with self._lock:
+            active_statuses: List[tuple[ChannelSessionEntry, SidecarStatus]] = []
+            live_emitted = 0
+            for e in self._sessions.values():
+                st = e.sidecar.get_status()
+                live_emitted += st.total_subtitles_emitted
+                if st.active:
+                    active_statuses.append((e, st))
+
+            total_emitted = self._archived_subtitles_count + live_emitted
+            if getattr(self.pipeline, "use_qwen3_asr", False):
+                asr_name = "Qwen3-ASR-0.6B"
+            elif self.pipeline.use_sensevoice:
+                asr_name = "SenseVoice-Small"
+            else:
+                asr_name = "Zipformer-En"
+            llm_tr = self.pipeline.llm_translator
+            tr_name = llm_tr.config.model if llm_tr.is_llm_ready else "CTranslate2"
+
+            if not active_statuses:
+                return SidecarStatus(
+                    active=False,
+                    channel_id="",
+                    channel_name="",
+                    upstream_url="",
+                    manual_pinned=False,
+                    subtitle_delay_ms=self.subtitle_delay_ms,
+                    display_mode=self.display_mode,
+                    last_touch_ago_sec=-1.0,
+                    total_subtitles_emitted=total_emitted,
+                    asr_engine=asr_name,
+                    translation_engine=tr_name,
+                    llm_ready=llm_tr.is_llm_ready,
+                    llm_error=llm_tr.last_error,
+                    sentence_mode=self.pipeline.sentence_mode,
+                    auto_sync=self.auto_sync,
+                    auto_stream_lead_ms=3500,
+                )
+
+            active_statuses.sort(key=lambda pair: pair[0].sidecar.last_touch_time, reverse=True)
+            primary_entry, primary_st = active_statuses[0]
+            if len(active_statuses) == 1:
+                disp_ch_name = primary_st.channel_name
+            else:
+                names = " / ".join(s.channel_name for _, s in active_statuses)
+                disp_ch_name = f"{names} ({len(active_statuses)}路并发)"
+
+            return SidecarStatus(
+                active=True,
+                channel_id=primary_st.channel_id,
+                channel_name=disp_ch_name,
+                upstream_url=primary_st.upstream_url,
+                manual_pinned=any(s.manual_pinned for _, s in active_statuses),
+                subtitle_delay_ms=self.subtitle_delay_ms,
+                display_mode=self.display_mode,
+                last_touch_ago_sec=primary_st.last_touch_ago_sec,
+                total_subtitles_emitted=total_emitted,
+                asr_engine=asr_name,
+                translation_engine=tr_name,
+                llm_ready=llm_tr.is_llm_ready,
+                llm_error=llm_tr.last_error,
+                sentence_mode=self.pipeline.sentence_mode,
+                auto_sync=self.auto_sync,
+                auto_stream_lead_ms=primary_st.auto_stream_lead_ms,
+            )

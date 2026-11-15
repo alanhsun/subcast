@@ -116,16 +116,35 @@ class LLMContextTranslator:
         "3. 严格只输出【当前待译原句】对应的简体中文译文，绝不输出任何解释、前缀、引号或多余内容。"
     )
 
-    def __init__(self, fallback_translator: LocalTranslator) -> None:
+    def __init__(
+        self,
+        fallback_translator: LocalTranslator,
+        shared_config: Optional[LLMConfig] = None,
+        shared_http: Optional[httpx.Client] = None,
+        shared_cache: Optional[dict[str, str]] = None,
+        parent: Optional["LLMContextTranslator"] = None,
+    ) -> None:
         self.fallback = fallback_translator
-        self.config = LLMConfig()
+        self.config = shared_config if shared_config is not None else LLMConfig()
         self.context_window: Deque[Tuple[str, str]] = collections.deque(maxlen=6)
         self.last_error: str = ""
         self.last_used_engine: str = "CTranslate2 (离线兜底)"
         # Persistent connection pool for minimal TLS handshake overhead
-        self._http = httpx.Client(timeout=6.5, verify=False)
-        self._cache: dict[str, str] = {}
+        self._http = shared_http if shared_http is not None else httpx.Client(timeout=6.5, verify=False)
+        self._cache: dict[str, str] = shared_cache if shared_cache is not None else {}
         self._lock = threading.RLock()
+        self._parent = parent
+
+    def clone_for_session(self) -> "LLMContextTranslator":
+        """Creates an isolated per-channel translator sharing LLMConfig & HTTP pool but with its own 6-sentence context window."""
+        root = self._parent or self
+        return LLMContextTranslator(
+            fallback_translator=self.fallback,
+            shared_config=self.config,
+            shared_http=self._http,
+            shared_cache=self._cache,
+            parent=root,
+        )
 
     def clear_context(self) -> None:
         with self._lock:
@@ -179,6 +198,8 @@ class LLMContextTranslator:
 
         if not self.is_llm_ready:
             self.last_used_engine = "CTranslate2 (未配置API Key，使用离线小模型)"
+            if self._parent is not None:
+                self._parent.last_used_engine = self.last_used_engine
             return self.fallback.translate(clean)
 
         # For interim previews, check cache first
@@ -192,7 +213,10 @@ class LLMContextTranslator:
                 with self._lock:
                     self.last_error = ""
                     self.last_used_engine = f"LLM ({self.config.model})"
-                    if len(self._cache) > 256:
+                    if self._parent is not None:
+                        self._parent.last_error = ""
+                        self._parent.last_used_engine = self.last_used_engine
+                    if len(self._cache) > 512:
                         self._cache.clear()
                     self._cache[clean] = zh_text
                     if is_final:
@@ -200,9 +224,13 @@ class LLMContextTranslator:
                 return zh_text
         except Exception as exc:
             self.last_error = str(exc)
+            if self._parent is not None:
+                self._parent.last_error = self.last_error
             print(f"[LLMTranslator] API fallback due to error: {exc}")
 
         self.last_used_engine = "CTranslate2 (API异常自动降级)"
+        if self._parent is not None:
+            self._parent.last_used_engine = self.last_used_engine
         return self.fallback.translate(clean)
 
     def _call_llm_api(self, source_text: str, channel_name: str) -> str:
@@ -471,11 +499,65 @@ class StreamingSpeechPipeline:
         self._samples_since_vad_pop: int = 0
         self._last_interim_emit_ts = 0.0
         self._last_interim_en = ""
+        self._shared_asr_lock = threading.RLock()
         self._asr_lock = threading.RLock()
         self.reset_stream()
 
+    def create_session_pipeline(
+        self,
+        channel_name: str = "Live Stream",
+        on_subtitle: Optional[Callable[[SubtitleEvent], None]] = None,
+    ) -> "StreamingSpeechPipeline":
+        """
+        Creates a lightweight, isolated per-channel pipeline (~2MB RAM, <3ms init) that shares
+        heavy read-only ONNX ASR/NMT weights (`qwen3_recognizer`, `local_translator`) via `_shared_asr_lock`,
+        while maintaining its own independent Silero-VAD state, clause aggregator, and 6-sentence LLM context.
+        """
+        sess = StreamingSpeechPipeline.__new__(StreamingSpeechPipeline)
+        sess.models_dir = self.models_dir
+        sess.on_subtitle = on_subtitle
+        sess.channel_name = channel_name
+        sess.num_threads = self.num_threads
+        sess.sentence_mode = self.sentence_mode
+        sess.async_translate_mode = self.async_translate_mode
+        sess.local_translator = self.local_translator
+        sess.llm_translator = self.llm_translator.clone_for_session()
+        sess.punctuator = self.punctuator
+        sess.vad_model_path = self.vad_model_path
+        sess.qwen3_dir = self.qwen3_dir
+        sess.sensevoice_dir = self.sensevoice_dir
+        sess.use_qwen3_asr = self.use_qwen3_asr
+        sess.use_sensevoice = self.use_sensevoice
+        sess.qwen3_recognizer = self.qwen3_recognizer
+        sess.sensevoice_recognizer = self.sensevoice_recognizer
+        sess.zipformer_recognizer = self.zipformer_recognizer
+        sess.last_asr_engine = self.last_asr_engine
+        sess.vad = None
+        if sess.use_sensevoice and sess.vad_model_path.exists():
+            sess._init_vad()
+        sess._vad_remainder = np.zeros(0, dtype=np.float32)
+        sess._speech_accum = np.zeros(0, dtype=np.float32)
+        sess._rolling_rms = 0.04
+        sess._pending_clauses = []
+        sess._pending_first_ts = 0.0
+        sess._pending_wait_samples = 0
+        sess._pending_last_asr_ms = 480.0
+        sess._samples_since_vad_pop = 0
+        sess._last_interim_emit_ts = 0.0
+        sess._last_interim_en = ""
+        sess._shared_asr_lock = self._shared_asr_lock
+        sess._asr_lock = threading.RLock()
+        sess.reset_stream(channel_name=channel_name)
+        return sess
+
     def _init_qwen3_asr(self) -> None:
-        qwen_threads = min(8, max(4, os.cpu_count() or 6))
+        env_threads = os.environ.get("LINGUARELAY_ASR_THREADS", "").strip()
+        if env_threads.isdigit() and int(env_threads) > 0:
+            qwen_threads = int(env_threads)
+        else:
+            # Match physical CPU cores (e.g. 4 threads on 4C/8T i3-10320, 6 on 8C/16T) to avoid
+            # Hyper-Threading contention when running 2-3 concurrent FFmpeg + VAD sessions.
+            qwen_threads = max(2, min(6, (os.cpu_count() or 4) // 2))
         self.qwen3_recognizer = sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
             conv_frontend=str(self.qwen3_dir / "conv_frontend.onnx"),
             encoder=str(self.qwen3_dir / "encoder.int8.onnx"),
@@ -541,7 +623,7 @@ class StreamingSpeechPipeline:
         clean = " ".join(raw_text.strip().lower().split())
         if not clean:
             return ""
-        with self._asr_lock:
+        with self._shared_asr_lock:
             res = self.punctuator.add_punctuation_with_case(clean).strip()
         if ensure_end_punct and res and res[-1] not in ".?!":
             res += "."
@@ -557,15 +639,16 @@ class StreamingSpeechPipeline:
             samples = samples[-max_samples:]
         samples = np.ascontiguousarray(samples, dtype=np.float32)
 
-        with self._asr_lock:
-            t0 = time.perf_counter()
+        t_wait0 = time.perf_counter()
+        with self._shared_asr_lock:
             if self.qwen3_recognizer is not None:
                 try:
                     stream = self.qwen3_recognizer.create_stream()
                     stream.accept_waveform(sample_rate, samples)
                     self.qwen3_recognizer.decode_stream(stream)
                     raw = stream.result.text.strip()
-                    self._pending_last_asr_ms = (time.perf_counter() - t0) * 1000.0
+                    # Include any brief queue wait in _pending_last_asr_ms so auto_sync dynamically subtracts it!
+                    self._pending_last_asr_ms = (time.perf_counter() - t_wait0) * 1000.0
                     self.last_asr_engine = "Qwen3-ASR-0.6B"
                     return raw
                 except Exception as exc:
@@ -580,7 +663,7 @@ class StreamingSpeechPipeline:
                 stream.accept_waveform(sample_rate, samples)
                 self.sensevoice_recognizer.decode_stream(stream)
                 raw = stream.result.text.strip()
-                self._pending_last_asr_ms = (time.perf_counter() - t0) * 1000.0
+                self._pending_last_asr_ms = (time.perf_counter() - t_wait0) * 1000.0
                 cleaned = self._SENSEVOICE_TAG_RE.sub("", raw).strip()
                 cleaned = re.sub(r"\.\s+([a-z])", r", \1", cleaned)
                 self.last_asr_engine = "SenseVoice"
@@ -936,14 +1019,16 @@ class StreamingSpeechPipeline:
     ) -> List[SubtitleEvent]:
         with self._asr_lock:
             events: List[SubtitleEvent] = []
-            self.stream.accept_waveform(sample_rate, samples)
-            while self.zipformer_recognizer.is_ready(self.stream):
-                self.zipformer_recognizer.decode_stream(self.stream)
-            raw_result = self.zipformer_recognizer.get_result(self.stream).strip()
-            is_endpoint = self.zipformer_recognizer.is_endpoint(self.stream)
+            with self._shared_asr_lock:
+                self.stream.accept_waveform(sample_rate, samples)
+                while self.zipformer_recognizer.is_ready(self.stream):
+                    self.zipformer_recognizer.decode_stream(self.stream)
+                raw_result = self.zipformer_recognizer.get_result(self.stream).strip()
+                is_endpoint = self.zipformer_recognizer.is_endpoint(self.stream)
+                if is_endpoint and raw_result:
+                    self.zipformer_recognizer.reset(self.stream)
             if is_endpoint and raw_result:
                 ev = self.process_text_direct(raw_result, is_final=True)
                 if ev:
                     events.append(ev)
-                self.zipformer_recognizer.reset(self.stream)
             return events

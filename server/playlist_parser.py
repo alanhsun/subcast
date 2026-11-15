@@ -263,11 +263,17 @@ def parse_txt(lines: List[str]) -> List[ChannelEntry]:
     return channels
 
 
-def build_proxy_url(base_url: str, channel: ChannelEntry) -> str:
+def sanitize_client_id(raw: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]", "", (raw or "").strip())
+    return clean[:32].lower()
+
+
+def build_proxy_url(base_url: str, channel: ChannelEntry, client_id: str = "") -> str:
     base = base_url.rstrip("/")
     token = encode_url_token(channel.url)
     ext = "index.m3u8" if channel.is_hls else "stream.ts"
-    return f"{base}/live/{channel.id}/{ext}?u={token}&name={quote(channel.name)}"
+    cid_param = f"&client={quote(sanitize_client_id(client_id))}" if sanitize_client_id(client_id) else ""
+    return f"{base}/live/{channel.id}/{ext}?u={token}&name={quote(channel.name)}{cid_param}"
 
 
 def export_m3u(
@@ -276,6 +282,7 @@ def export_m3u(
     only_foreign: bool = False,
     direct_chinese: bool = False,
     extra_epg_url: str = "",
+    client_id: str = "",
 ) -> str:
     base = base_url.rstrip("/")
     if extra_epg_url:
@@ -308,7 +315,7 @@ def export_m3u(
         if direct_chinese and not ch.need_translate:
             out.append(ch.url)
         else:
-            out.append(build_proxy_url(base_url, ch))
+            out.append(build_proxy_url(base_url, ch, client_id=client_id))
     return "\n".join(out) + "\n"
 
 
@@ -317,6 +324,7 @@ def export_txt(
     base_url: str,
     only_foreign: bool = False,
     direct_chinese: bool = False,
+    client_id: str = "",
 ) -> str:
     grouped: dict[str, List[ChannelEntry]] = {}
     for ch in channels:
@@ -330,7 +338,9 @@ def export_txt(
         merged_by_name: dict[str, List[str]] = {}
         for ch in items:
             target_url = (
-                ch.url if (direct_chinese and not ch.need_translate) else build_proxy_url(base_url, ch)
+                ch.url
+                if (direct_chinese and not ch.need_translate)
+                else build_proxy_url(base_url, ch, client_id=client_id)
             )
             urls = merged_by_name.setdefault(ch.name, [])
             if target_url not in urls:

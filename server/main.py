@@ -8,10 +8,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import platform
 import socket
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -27,8 +28,14 @@ from server.playlist_parser import (
     export_m3u,
     export_txt,
     parse_playlist,
+    sanitize_client_id,
 )
-from server.stream_proxy import AudioSidecarManager, rewrite_m3u8_manifest
+from server.stream_proxy import (
+    AudioSidecarManager,
+    MultiSessionSidecarPool,
+    make_client_key,
+    rewrite_m3u8_manifest,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
@@ -66,29 +73,193 @@ def get_lan_ip(peer_ip: str = "192.168.31.1") -> str:
     return "127.0.0.1"
 
 
+_HOST_HW_CACHE: Optional[dict] = None
+_RESERVED_CLIENT_SLUGS = {"api", "live", "download", "ws"}
+
+
+def get_host_hardware_info() -> dict:
+    """Detects host CPU model, logical core count, and total RAM (works inside Linux Docker & Windows dev)."""
+    global _HOST_HW_CACHE
+    if _HOST_HW_CACHE is not None:
+        return dict(_HOST_HW_CACHE)
+
+    cpu_model = ""
+    ram_gb = 0.0
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        try:
+            for line in cpuinfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.lower().startswith("model name") and ":" in line:
+                    cpu_model = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        try:
+            for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        ram_gb = round(int(parts[1]) / (1024.0 * 1024.0), 1)
+                    break
+        except Exception:
+            pass
+
+    if not cpu_model:
+        cpu_model = platform.processor() or platform.machine() or "x86_64 CPU"
+
+    _HOST_HW_CACHE = {
+        "cpu_model": cpu_model,
+        "cpu_logical_cores": os.cpu_count() or 1,
+        "ram_total_gb": ram_gb,
+    }
+    return dict(_HOST_HW_CACHE)
+
+
+def _extract_client_ip(req_or_ws: Request | WebSocket) -> str:
+    xff = req_or_ws.headers.get("x-forwarded-for", "").strip()
+    if xff:
+        ip = xff.split(",")[0].strip()
+    else:
+        ip = req_or_ws.headers.get("x-real-ip", "").strip()
+    if not ip and req_or_ws.client:
+        ip = req_or_ws.client.host or ""
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+    return ip or "local"
+
+
+@dataclass
+class WsClientMeta:
+    ws: WebSocket
+    client_key: str
+    client_ip: str
+    client_tag: str
+    role: str = "tv"  # "tv" | "console"
+    display_mode: Optional[str] = None
+    font_scale: Optional[float] = None
+    connected_at: float = 0.0
+
+
 class ConnectionHub:
     def __init__(self) -> None:
         self.clients: set[WebSocket] = set()
+        self.meta: dict[WebSocket, WsClientMeta] = {}
 
-    async def connect(self, ws: WebSocket) -> None:
+    async def connect(
+        self,
+        ws: WebSocket,
+        client_ip: str = "local",
+        client_tag: str = "",
+        role: str = "tv",
+    ) -> WsClientMeta:
         await ws.accept()
+        clean_tag = sanitize_client_id(client_tag)
+        ckey = make_client_key(client_ip, clean_tag)
+        info = WsClientMeta(
+            ws=ws,
+            client_key=ckey,
+            client_ip=client_ip,
+            client_tag=clean_tag,
+            role="console" if role == "console" else "tv",
+            connected_at=time.time(),
+        )
         self.clients.add(ws)
+        self.meta[ws] = info
+        return info
 
     def disconnect(self, ws: WebSocket) -> None:
         self.clients.discard(ws)
+        self.meta.pop(ws, None)
+
+    @staticmethod
+    def _serialize_for_meta(message: dict, info: Optional[WsClientMeta]) -> str:
+        if (
+            info is not None
+            and info.role != "console"
+            and message.get("type") in ("subtitle", "status")
+            and (info.display_mode is not None or info.font_scale is not None)
+        ):
+            patched = dict(message)
+            if info.display_mode is not None:
+                patched["display_mode"] = info.display_mode
+            if info.font_scale is not None:
+                patched["font_scale"] = info.font_scale
+            return json.dumps(patched, ensure_ascii=False)
+        return json.dumps(message, ensure_ascii=False)
 
     async def broadcast(self, message: dict) -> None:
         if not self.clients:
             return
-        raw = json.dumps(message, ensure_ascii=False)
         stale: List[WebSocket] = []
         for ws in list(self.clients):
+            info = self.meta.get(ws)
             try:
-                await ws.send_text(raw)
+                await ws.send_text(self._serialize_for_meta(message, info))
             except Exception:
                 stale.append(ws)
         for ws in stale:
-            self.clients.discard(ws)
+            self.disconnect(ws)
+
+    async def send_to_client(self, client_key: str, message: dict, include_console: bool = False) -> None:
+        if not self.clients or not client_key:
+            return
+        stale: List[WebSocket] = []
+        for ws in list(self.clients):
+            info = self.meta.get(ws)
+            if info is None:
+                continue
+            if info.client_key == client_key or (include_console and info.role == "console"):
+                try:
+                    await ws.send_text(self._serialize_for_meta(message, info))
+                except Exception:
+                    stale.append(ws)
+        for ws in stale:
+            self.disconnect(ws)
+
+    async def route_session_message(
+        self,
+        channel_key: str,
+        viewer_keys: set[str],
+        manual_pinned: bool,
+        active_session_count: int,
+        message: dict,
+    ) -> None:
+        if not self.clients:
+            return
+        pool = _sidecar
+        stale: List[WebSocket] = []
+        for ws in list(self.clients):
+            info = self.meta.get(ws)
+            deliver = False
+            if info is None or info.role == "console":
+                deliver = True
+            elif info.client_key in viewer_keys:
+                deliver = True
+            else:
+                binding = pool.get_client_binding(info.client_key) if pool is not None else None
+                if binding is not None:
+                    # Strictly isolated: bound to a Chinese channel or another foreign channel -> never cross-talk!
+                    deliver = bool(binding.need_translate and channel_key and binding.channel_key == channel_key)
+                else:
+                    # Unbound TV socket (no active /live/... stream from its IP/tag yet):
+                    # deliver when manually pinned from Web Console or when only 1 session is active on LAN.
+                    if not info.client_tag and (manual_pinned or active_session_count <= 1):
+                        deliver = True
+            if deliver:
+                try:
+                    await ws.send_text(self._serialize_for_meta(message, info))
+                except Exception:
+                    stale.append(ws)
+        for ws in stale:
+            self.disconnect(ws)
+
+    def tv_client_count(self) -> int:
+        if not self.clients:
+            return 0
+        tv_cnt = sum(1 for m in self.meta.values() if m.role != "console")
+        return tv_cnt
 
 
 class UDPDiscoveryProtocol(asyncio.DatagramProtocol):
@@ -134,7 +305,7 @@ DEFAULT_EPG_SOURCE_URL = (
 
 hub = ConnectionHub()
 _pipeline: Optional[StreamingSpeechPipeline] = None
-_sidecar: Optional[AudioSidecarManager] = None
+_sidecar: Optional[MultiSessionSidecarPool] = None
 _channels: List[ChannelEntry] = []
 _raw_env_epg = os.environ.get("LINGUARELAY_EPG_URL", "").strip()
 _epg_source_url: str = (
@@ -155,7 +326,7 @@ def load_channels_from_disk() -> List[ChannelEntry]:
     return _channels
 
 
-def load_settings_into_sidecar(sidecar: AudioSidecarManager) -> None:
+def load_settings_into_sidecar(sidecar: MultiSessionSidecarPool | AudioSidecarManager) -> None:
     global _epg_source_url
     env_base_url = os.environ.get("LINGUARELAY_LLM_BASE_URL", "https://api.minimaxi.com/v1").strip()
     env_api_key = os.environ.get("LINGUARELAY_LLM_API_KEY", "").strip()
@@ -199,7 +370,7 @@ def load_settings_into_sidecar(sidecar: AudioSidecarManager) -> None:
         )
 
 
-def save_settings_from_sidecar(sidecar: AudioSidecarManager) -> None:
+def save_settings_from_sidecar(sidecar: MultiSessionSidecarPool | AudioSidecarManager) -> None:
     llm_cfg = sidecar.pipeline.llm_translator.config
     data = {
         "subtitle_delay_ms": sidecar.subtitle_delay_ms,
@@ -219,11 +390,16 @@ def save_settings_from_sidecar(sidecar: AudioSidecarManager) -> None:
     SETTINGS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def get_sidecar() -> AudioSidecarManager:
+def get_sidecar() -> MultiSessionSidecarPool:
     global _pipeline, _sidecar
     if _sidecar is None:
         _pipeline = StreamingSpeechPipeline()
-        _sidecar = AudioSidecarManager(pipeline=_pipeline, broadcast_cb=hub.broadcast)
+        _sidecar = MultiSessionSidecarPool(
+            pipeline=_pipeline,
+            route_session_cb=hub.route_session_message,
+            send_client_cb=hub.send_to_client,
+            broadcast_all_cb=hub.broadcast,
+        )
         load_settings_into_sidecar(_sidecar)
     return _sidecar
 
@@ -277,7 +453,7 @@ async def lifespan(app: FastAPI):
     yield
 
     epg_task.cancel()
-    sidecar.stop_current()
+    sidecar.close()
     if udp_transport:
         udp_transport.close()
 
@@ -293,14 +469,29 @@ def _resolve_base_url(request: Request) -> str:
     return f"http://{get_lan_ip()}:{port}"
 
 
+def _resolve_client_tag(client_tag: str = "", query_client: str = "") -> str:
+    if client_tag and client_tag.lower() in _RESERVED_CLIENT_SLUGS:
+        raise HTTPException(status_code=404, detail="Not found")
+    return sanitize_client_id(client_tag or query_client)
+
+
 @app.get("/playlist.m3u")
-async def get_playlist_m3u(request: Request, only_foreign: bool = False, direct_chinese: bool = False) -> Response:
+@app.get("/{client_tag}/playlist.m3u")
+async def get_playlist_m3u(
+    request: Request,
+    client_tag: str = "",
+    client: str = Query("", description="Optional client channel tag (e.g. tv1, tv2)"),
+    only_foreign: bool = False,
+    direct_chinese: bool = False,
+) -> Response:
+    cid = _resolve_client_tag(client_tag, client)
     base_url = _resolve_base_url(request)
     body = export_m3u(
         _channels,
         base_url,
         only_foreign=only_foreign,
         direct_chinese=direct_chinese,
+        client_id=cid,
     )
     return Response(
         content=body.encode("utf-8"),
@@ -310,9 +501,15 @@ async def get_playlist_m3u(request: Request, only_foreign: bool = False, direct_
 
 
 @app.get("/playlist_foreign.m3u")
-async def get_playlist_foreign_m3u(request: Request) -> Response:
+@app.get("/{client_tag}/playlist_foreign.m3u")
+async def get_playlist_foreign_m3u(
+    request: Request,
+    client_tag: str = "",
+    client: str = Query("", description="Optional client channel tag (e.g. tv1, tv2)"),
+) -> Response:
+    cid = _resolve_client_tag(client_tag, client)
     base_url = _resolve_base_url(request)
-    body = export_m3u(_channels, base_url, only_foreign=True)
+    body = export_m3u(_channels, base_url, only_foreign=True, client_id=cid)
     return Response(
         content=body.encode("utf-8"),
         media_type="audio/x-mpegurl; charset=utf-8",
@@ -321,16 +518,36 @@ async def get_playlist_foreign_m3u(request: Request) -> Response:
 
 
 @app.get("/playlist.txt")
-async def get_playlist_txt(request: Request, only_foreign: bool = False, direct_chinese: bool = False) -> PlainTextResponse:
+@app.get("/{client_tag}/playlist.txt")
+async def get_playlist_txt(
+    request: Request,
+    client_tag: str = "",
+    client: str = Query("", description="Optional client channel tag (e.g. tv1, tv2)"),
+    only_foreign: bool = False,
+    direct_chinese: bool = False,
+) -> PlainTextResponse:
+    cid = _resolve_client_tag(client_tag, client)
     base_url = _resolve_base_url(request)
-    body = export_txt(_channels, base_url, only_foreign=only_foreign, direct_chinese=direct_chinese)
+    body = export_txt(
+        _channels,
+        base_url,
+        only_foreign=only_foreign,
+        direct_chinese=direct_chinese,
+        client_id=cid,
+    )
     return PlainTextResponse(content=body, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/playlist_foreign.txt")
-async def get_playlist_foreign_txt(request: Request) -> PlainTextResponse:
+@app.get("/{client_tag}/playlist_foreign.txt")
+async def get_playlist_foreign_txt(
+    request: Request,
+    client_tag: str = "",
+    client: str = Query("", description="Optional client channel tag (e.g. tv1, tv2)"),
+) -> PlainTextResponse:
+    cid = _resolve_client_tag(client_tag, client)
     base_url = _resolve_base_url(request)
-    body = export_txt(_channels, base_url, only_foreign=True)
+    body = export_txt(_channels, base_url, only_foreign=True, client_id=cid)
     return PlainTextResponse(content=body, media_type="text/plain; charset=utf-8")
 
 
@@ -665,23 +882,31 @@ async def get_diyp_epg(
 
 
 @app.get("/tvbox.json")
-async def get_tvbox_json(request: Request) -> dict:
+@app.get("/{client_tag}/tvbox.json")
+async def get_tvbox_json(
+    request: Request,
+    client_tag: str = "",
+    client: str = Query("", description="Optional client channel tag (e.g. tv1, tv2)"),
+) -> dict:
+    cid = _resolve_client_tag(client_tag, client)
     base_url = _resolve_base_url(request)
+    prefix = f"/{cid}" if cid else ""
+    label_suffix = f" [{cid}]" if cid else ""
     return {
         "lives": [
             {
-                "name": "声幕 SubCast 全频道(含全套EPG+外语AI字幕)",
+                "name": f"声幕 SubCast 全频道(含全套EPG+外语AI字幕){label_suffix}",
                 "type": 0,
-                "url": f"{base_url}/playlist.m3u",
+                "url": f"{base_url}{prefix}/playlist.m3u",
                 "playerType": 2,
                 "ua": "okhttp/3.12.11",
                 "epg": f"{base_url}/epg?ch={{name}}&date={{date}}",
                 "logo": "https://live.fanmingming.com/tv/{name}.png",
             },
             {
-                "name": "声幕 SubCast 外语同传专区(109路国际台)",
+                "name": f"声幕 SubCast 外语同传专区(109路国际台){label_suffix}",
                 "type": 0,
-                "url": f"{base_url}/playlist_foreign.m3u",
+                "url": f"{base_url}{prefix}/playlist_foreign.m3u",
                 "playerType": 2,
                 "ua": "okhttp/3.12.11",
                 "epg": f"{base_url}/epg?ch={{name}}&date={{date}}",
@@ -697,11 +922,16 @@ async def proxy_hls_manifest(
     request: Request,
     u: str = Query(..., description="Base64URL encoded upstream URL"),
     name: str = Query("Live Channel", description="Channel display name"),
+    client: str = Query("", description="Optional client channel tag for multi-TV isolation"),
 ) -> Response:
     try:
         upstream_url = decode_url_token(u)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid stream token: {exc}") from exc
+
+    client_ip = _extract_client_ip(request)
+    client_tag = sanitize_client_id(client)
+    client_key = make_client_key(client_ip, client_tag)
 
     root_url = upstream_url
     need_translate = True
@@ -728,9 +958,12 @@ async def proxy_hls_manifest(
 
     sidecar = get_sidecar()
     if not need_translate:
-        if not sidecar.manual_pinned:
-            sidecar.stop_current()
-            await hub.broadcast({"type": "clear"})
+        await sidecar.mark_client_chinese_channel(
+            client_key=client_key,
+            client_ip=client_ip,
+            client_tag=client_tag,
+            channel_name=name,
+        )
 
     headers = {
         "User-Agent": request.headers.get(
@@ -751,10 +984,10 @@ async def proxy_hls_manifest(
     stream_proxy = sidecar.stream_proxy or None
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=6.5, verify=False, proxy=stream_proxy
-    ) as client:
+    ) as http_client:
         for try_url in urls_to_fetch:
             try:
-                resp = await client.get(try_url, headers=headers)
+                resp = await http_client.get(try_url, headers=headers)
                 last_status = resp.status_code
                 if resp.status_code < 400 and resp.text.strip():
                     matched_source_url = try_url
@@ -769,14 +1002,17 @@ async def proxy_hls_manifest(
 
     if need_translate:
         ordered_candidates = [matched_source_url] + [
-            u for u in candidate_urls if u and u != matched_source_url
+            u_cand for u_cand in candidate_urls if u_cand and u_cand != matched_source_url
         ]
-        sidecar.update_hls_manifest_metrics(text)
-        sidecar.touch_channel(
+        await sidecar.touch_client_channel(
+            client_key=client_key,
+            client_ip=client_ip,
+            client_tag=client_tag,
             channel_id=channel_id,
             channel_name=name,
             upstream_url=matched_source_url,
             candidate_urls=ordered_candidates,
+            manifest_text=text,
         )
 
     base_url = _resolve_base_url(request)
@@ -786,6 +1022,7 @@ async def proxy_hls_manifest(
         base_proxy_url=base_url,
         channel_id=channel_id,
         channel_name=name,
+        client_id=client_tag,
     )
     return Response(
         content=rewritten.encode("utf-8"),
@@ -800,11 +1037,16 @@ async def proxy_direct_stream(
     request: Request,
     u: str = Query(..., description="Base64URL encoded upstream URL"),
     name: str = Query("Live Channel", description="Channel display name"),
+    client: str = Query("", description="Optional client channel tag for multi-TV isolation"),
 ) -> StreamingResponse:
     try:
         upstream_url = decode_url_token(u)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid stream token: {exc}") from exc
+
+    client_ip = _extract_client_ip(request)
+    client_tag = sanitize_client_id(client)
+    client_key = make_client_key(client_ip, client_tag)
 
     need_translate = True
     backup_urls: List[str] = []
@@ -820,51 +1062,95 @@ async def proxy_direct_stream(
             if ch.url and ch.url not in backup_urls:
                 backup_urls.append(ch.url)
 
+    ordered_candidates = [upstream_url] + [bu for bu in backup_urls if bu != upstream_url]
     sidecar = get_sidecar()
     if need_translate:
-        sidecar.touch_channel(
+        await sidecar.touch_client_channel(
+            client_key=client_key,
+            client_ip=client_ip,
+            client_tag=client_tag,
             channel_id=channel_id,
             channel_name=name,
             upstream_url=upstream_url,
-            candidate_urls=[upstream_url] + [bu for bu in backup_urls if bu != upstream_url],
+            candidate_urls=ordered_candidates,
         )
-    elif not sidecar.manual_pinned:
-        sidecar.stop_current()
-        await hub.broadcast({"type": "clear"})
+    else:
+        await sidecar.mark_client_chinese_channel(
+            client_key=client_key,
+            client_ip=client_ip,
+            client_tag=client_tag,
+            channel_name=name,
+        )
 
     stream_proxy = sidecar.stream_proxy or None
 
     async def _stream_generator():
-        client = httpx.AsyncClient(
+        http_client = httpx.AsyncClient(
             follow_redirects=True, timeout=None, verify=False, proxy=stream_proxy
         )
+        last_touch_mono = time.monotonic()
         try:
-            async with client.stream("GET", upstream_url) as resp:
+            async with http_client.stream("GET", upstream_url) as resp:
                 async for chunk in resp.aiter_bytes(chunk_size=32768):
                     if need_translate:
-                        sidecar.touch_channel(
-                            channel_id=channel_id,
-                            channel_name=name,
-                            upstream_url=upstream_url,
-                        )
+                        now_m = time.monotonic()
+                        if (now_m - last_touch_mono) >= 3.0:
+                            last_touch_mono = now_m
+                            await sidecar.touch_client_channel(
+                                client_key=client_key,
+                                client_ip=client_ip,
+                                client_tag=client_tag,
+                                channel_id=channel_id,
+                                channel_name=name,
+                                upstream_url=upstream_url,
+                                candidate_urls=ordered_candidates,
+                            )
                     yield chunk
         finally:
-            await client.aclose()
+            await http_client.aclose()
 
     return StreamingResponse(_stream_generator(), media_type="video/mp2t")
 
 
 @app.websocket("/ws/subtitles")
-async def websocket_subtitles(ws: WebSocket) -> None:
-    await hub.connect(ws)
+@app.websocket("/{client_tag}/ws/subtitles")
+async def websocket_subtitles(
+    ws: WebSocket,
+    client_tag: str = "",
+    client: str = Query(""),
+    role: str = Query("tv"),
+) -> None:
+    if client_tag and client_tag.lower() in _RESERVED_CLIENT_SLUGS:
+        await ws.close(code=1008)
+        return
+    info = await hub.connect(
+        ws,
+        client_ip=_extract_client_ip(ws),
+        client_tag=client_tag or client,
+        role=role,
+    )
     sidecar = get_sidecar()
     status = sidecar.get_status()
+    recent_items = sidecar.recent_subtitles[-5:]
+    if info.role != "console":
+        binding = sidecar.get_client_binding(info.client_key)
+        if binding is not None:
+            if not binding.need_translate:
+                recent_items = []
+            else:
+                recent_items = [
+                    r for r in sidecar.recent_subtitles if r.get("channel") == binding.channel_name
+                ][-5:]
+        elif info.client_tag:
+            recent_items = []
+
     await ws.send_text(
         json.dumps(
             {
                 "type": "connected",
+                "client_key": info.client_key,
                 "status": asdict(status),
-                "recent": sidecar.recent_subtitles[-5:],
+                "recent": recent_items,
             },
             ensure_ascii=False,
         )
@@ -876,20 +1162,47 @@ async def websocket_subtitles(ws: WebSocket) -> None:
                 data = json.loads(msg_text)
                 action = data.get("action")
                 if action == "update_settings":
+                    new_delay: Optional[int] = None
                     if "subtitle_delay_ms" in data:
                         new_delay = max(0, min(18000, int(data["subtitle_delay_ms"])))
                         if sidecar.auto_sync and new_delay > 3500:
                             new_delay = 800
-                        sidecar.subtitle_delay_ms = new_delay
-                    if "display_mode" in data:
-                        sidecar.display_mode = str(data["display_mode"])
-                    if "font_scale" in data:
-                        sidecar.font_scale = float(data["font_scale"])
-                    if data.get("sentence_mode") in ("full_sentence", "paragraph", "fast_clause"):
-                        sidecar.sentence_mode = str(data["sentence_mode"])
-                        sidecar.pipeline.sentence_mode = str(data["sentence_mode"])
-                    save_settings_from_sidecar(sidecar)
-                    await hub.broadcast({"type": "settings", "status": asdict(sidecar.get_status())})
+
+                    if info.role == "console":
+                        sidecar.apply_settings(
+                            subtitle_delay_ms=new_delay,
+                            display_mode=str(data["display_mode"]) if "display_mode" in data else None,
+                            font_scale=float(data["font_scale"]) if "font_scale" in data else None,
+                            sentence_mode=(
+                                str(data["sentence_mode"])
+                                if data.get("sentence_mode") in ("full_sentence", "paragraph", "fast_clause")
+                                else None
+                            ),
+                        )
+                        save_settings_from_sidecar(sidecar)
+                        await hub.broadcast({"type": "settings", "status": asdict(sidecar.get_status())})
+                    else:
+                        # Per-TV isolation: store display_mode & font_scale per TV socket so TV 1 never overwrites TV 2
+                        if data.get("display_mode") in ("bilingual", "zh_only"):
+                            info.display_mode = str(data["display_mode"])
+                            if hub.tv_client_count() <= 1:
+                                sidecar.apply_settings(display_mode=info.display_mode)
+                        if "font_scale" in data:
+                            info.font_scale = max(0.6, min(2.0, float(data["font_scale"])))
+                            if hub.tv_client_count() <= 1:
+                                sidecar.apply_settings(font_scale=info.font_scale)
+                        if new_delay is not None:
+                            sidecar.set_client_delay(info.client_key, new_delay)
+                        if data.get("sentence_mode") in ("full_sentence", "paragraph", "fast_clause"):
+                            sidecar.apply_settings(sentence_mode=str(data["sentence_mode"]))
+                        if hub.tv_client_count() <= 1:
+                            save_settings_from_sidecar(sidecar)
+                        st_dict = asdict(sidecar.get_status())
+                        if info.display_mode:
+                            st_dict["display_mode"] = info.display_mode
+                        await ws.send_text(
+                            json.dumps({"type": "settings", "status": st_dict}, ensure_ascii=False)
+                        )
                 elif action == "ping":
                     await ws.send_text(json.dumps({"type": "pong", "ts": time.time()}))
             except Exception:
@@ -930,6 +1243,7 @@ class PinChannelPayload(BaseModel):
 class TestSubtitlePayload(BaseModel):
     en: str = "Good evening, breaking news from our live broadcast studio in London."
     zh: str = ""
+    client_tag: str = ""
 
 
 class EpgSourcePayload(BaseModel):
@@ -1214,9 +1528,12 @@ async def api_status(request: Request) -> dict:
     base_url = _resolve_base_url(request)
     llm_cfg = sidecar.pipeline.llm_translator.config
     _ensure_epg_cache()
+    active_sessions = sidecar.get_sessions_summary()
     return {
         "lan_ip": get_lan_ip(),
+        "caller_ip": _extract_client_ip(request),
         "base_url": base_url,
+        "tvbox_url": f"{base_url}/tvbox.json",
         "m3u_url": f"{base_url}/playlist.m3u",
         "txt_url": f"{base_url}/playlist.txt",
         "epg_xml_url": f"{base_url}/epg.xml",
@@ -1225,7 +1542,11 @@ async def api_status(request: Request) -> dict:
         "epg_channel_count": len(_epg_prog_map),
         "epg_last_sync": _epg_last_sync,
         "ws_url": f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/subtitles",
-        "tv_clients_connected": len(hub.clients),
+        "tv_clients_connected": hub.tv_client_count(),
+        "hardware": get_host_hardware_info(),
+        "max_sessions": sidecar.max_sessions,
+        "active_sessions": active_sessions,
+        "client_bindings": sidecar.get_clients_summary(),
         "sidecar": asdict(sidecar.get_status()),
         "llm_config": {
             "enabled": llm_cfg.enabled,
@@ -1305,17 +1626,21 @@ async def api_update_playlist(payload: PlaylistUpdatePayload) -> dict:
 @app.post("/api/settings")
 async def api_update_settings(payload: SettingsUpdatePayload) -> dict:
     sidecar = get_sidecar()
-    if payload.subtitle_delay_ms is not None:
-        sidecar.subtitle_delay_ms = max(0, min(18000, payload.subtitle_delay_ms))
-    if payload.display_mode in ("bilingual", "zh_only"):
-        sidecar.display_mode = payload.display_mode
-    if payload.font_scale is not None:
-        sidecar.font_scale = max(0.6, min(2.0, payload.font_scale))
-    if payload.sentence_mode in ("full_sentence", "paragraph", "fast_clause"):
-        sidecar.sentence_mode = payload.sentence_mode
-        sidecar.pipeline.sentence_mode = payload.sentence_mode
-    if payload.auto_sync is not None:
-        sidecar.auto_sync = payload.auto_sync
+    sidecar.apply_settings(
+        subtitle_delay_ms=(
+            max(0, min(18000, payload.subtitle_delay_ms))
+            if payload.subtitle_delay_ms is not None
+            else None
+        ),
+        display_mode=payload.display_mode if payload.display_mode in ("bilingual", "zh_only") else None,
+        font_scale=max(0.6, min(2.0, payload.font_scale)) if payload.font_scale is not None else None,
+        sentence_mode=(
+            payload.sentence_mode
+            if payload.sentence_mode in ("full_sentence", "paragraph", "fast_clause")
+            else None
+        ),
+        auto_sync=payload.auto_sync,
+    )
     save_settings_from_sidecar(sidecar)
     status_dict = asdict(sidecar.get_status())
     await hub.broadcast({"type": "settings", "status": status_dict})
@@ -1325,30 +1650,60 @@ async def api_update_settings(payload: SettingsUpdatePayload) -> dict:
 @app.post("/api/pin")
 async def api_pin_channel(payload: PinChannelPayload) -> dict:
     sidecar = get_sidecar()
-    sidecar.touch_channel(
-        channel_id=payload.channel_id or "manual",
+    cid = payload.channel_id or "manual"
+    base_name = (payload.name or "").split(" (源")[0].strip()
+    candidate_urls: List[str] = [payload.url]
+    for ch in _channels:
+        ch_base = (ch.name or "").split(" (源")[0].strip()
+        if ch.id == cid or (base_name and ch_base == base_name):
+            if ch.url and ch.url not in candidate_urls:
+                candidate_urls.append(ch.url)
+    st = await sidecar.pin_channel(
+        channel_id=cid,
         channel_name=payload.name,
         upstream_url=payload.url,
-        manual_pin=True,
+        candidate_urls=candidate_urls,
     )
-    return {"ok": True, "sidecar": asdict(sidecar.get_status())}
+    return {
+        "ok": True,
+        "sidecar": asdict(st),
+        "active_sessions": sidecar.get_sessions_summary(),
+    }
 
 
 @app.post("/api/stop")
-async def api_stop_sidecar() -> dict:
+async def api_stop_sidecar(
+    channel_key: str = Query("", description="Optional specific session key to stop"),
+) -> dict:
     sidecar = get_sidecar()
-    sidecar.stop_current()
-    await hub.broadcast({"type": "clear"})
-    return {"ok": True, "sidecar": asdict(sidecar.get_status())}
+    _, viewers = sidecar.stop_session(channel_key)
+    if channel_key:
+        for vk in viewers:
+            await hub.send_to_client(vk, {"type": "clear"})
+        if not sidecar.get_sessions_summary():
+            await hub.route_session_message("", set(), False, 0, {"type": "clear"})
+    else:
+        await hub.broadcast({"type": "clear"})
+    return {
+        "ok": True,
+        "sidecar": asdict(sidecar.get_status()),
+        "active_sessions": sidecar.get_sessions_summary(),
+    }
 
 
 @app.post("/api/test-subtitle")
-async def api_send_test_subtitle(payload: TestSubtitlePayload) -> dict:
+@app.post("/{client_tag}/api/test-subtitle")
+async def api_send_test_subtitle(
+    payload: TestSubtitlePayload,
+    client_tag: str = "",
+    client: str = Query("", description="Optional target client channel tag"),
+) -> dict:
+    target_tag = _resolve_client_tag(client_tag, client or payload.client_tag)
     sidecar = get_sidecar()
     ev = sidecar.pipeline.process_text_direct(payload.en, is_final=True)
     msg = {
         "type": "subtitle",
-        "channel": "测试字幕",
+        "channel": f"测试字幕 [{target_tag}]" if target_tag else "测试字幕",
         "en": ev.en if ev else payload.en,
         "zh": ev.zh if (ev and ev.zh) else payload.zh,
         "is_final": True,
@@ -1358,8 +1713,11 @@ async def api_send_test_subtitle(payload: TestSubtitlePayload) -> dict:
         "display_mode": sidecar.display_mode,
         "font_scale": sidecar.font_scale,
     }
-    await hub.broadcast(msg)
-    return {"ok": True, "subtitle": msg}
+    if target_tag:
+        await hub.send_to_client(make_client_key("", target_tag), msg, include_console=True)
+    else:
+        await hub.broadcast(msg)
+    return {"ok": True, "subtitle": msg, "client_tag": target_tag}
 
 
 WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
@@ -2083,6 +2441,10 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
         <span class="nav__stat-label">在线电视</span>
         <span id="tvBadge" class="nav__stat-val">0</span>
       </div>
+      <div class="nav__stat" id="slotStatWrap" title="多客户端并发隔离会话池">
+        <span class="nav__stat-label">并发听译</span>
+        <span id="slotBadge" class="nav__stat-val">0/3 路</span>
+      </div>
       <div class="nav__stat">
         <span id="tapDot" class="status-dot"></span>
         <span class="nav__stat-label">监听状态</span>
@@ -2105,12 +2467,14 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
   <!-- Section 1: Live Subtitle Monitor -->
   <section class="card">
     <div class="section-head--split">
-      <h2>实时字幕监听 <span class="muted">电视端无背景叠加与音频延迟校准</span></h2>
+      <h2>实时字幕监听 <span class="muted">多终端并发同传与音频延迟自动校准</span></h2>
       <div style="display:flex; gap:8px;">
         <button type="button" class="btn btn--secondary btn--sm" onclick="sendTestSub()">发送测试字幕</button>
-        <button type="button" class="btn btn--secondary btn--sm" onclick="stopTap()">停止监听</button>
+        <button type="button" class="btn btn--secondary btn--sm" onclick="stopTap()">全部停止</button>
       </div>
     </div>
+
+    <div id="activeSessionsBar" style="display:none; flex-wrap:wrap; align-items:center; gap:8px;"></div>
 
     <div class="monitor-frame ground-inverse">
       <div class="monitor-bar">
@@ -2245,10 +2609,23 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
 
     <section class="card span-6">
       <div class="section-head--split">
-        <h2><span class="step-num">02</span> 代理订阅地址 <span class="muted">填入影视仓或 Jellyfin</span></h2>
+        <h2><span class="step-num">02</span> 代理订阅地址 <span class="muted">支持多终端并发隔离</span></h2>
+        <div class="tabs" id="clientTagSeg" role="tablist" aria-label="多终端通道选择">
+          <button type="button" class="tab" role="tab" aria-selected="true" data-tag="" onclick="setClientTag('')">自动 (按IP)</button>
+          <button type="button" class="tab" role="tab" aria-selected="false" data-tag="tv1" onclick="setClientTag('tv1')">终端1</button>
+          <button type="button" class="tab" role="tab" aria-selected="false" data-tag="tv2" onclick="setClientTag('tv2')">终端2</button>
+          <button type="button" class="tab" role="tab" aria-selected="false" data-tag="tv3" onclick="setClientTag('tv3')">终端3</button>
+        </div>
       </div>
 
       <ul class="rows">
+        <li>
+          <div>
+            <div class="rows__name">影视仓配置接口 <span class="muted" style="font-size:12px;">TVBox 一键订阅 · 含全频道 + 外语专区 + EPG</span></div>
+            <div id="tvboxUrl" class="rows__sub">...</div>
+          </div>
+          <button type="button" class="btn btn--secondary btn--sm" onclick="copyText('tvboxUrl', this)">复制地址</button>
+        </li>
         <li>
           <div>
             <div class="rows__name">M3U 订阅 <span class="muted" style="font-size:12px;">推荐 · 影视仓与 Jellyfin 通用，自带台标与 EPG 关联</span></div>
@@ -2265,7 +2642,7 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
         </li>
         <li>
           <div>
-            <div class="rows__name">TXT 纯文本订阅 <span class="muted" style="font-size:12px;">仅含频道与分组</span></div>
+            <div class="rows__name">TXT 纯文本订阅 <span id="apkHostHint" class="muted" style="font-size:12px;">同局域网各设备按 IP 自动隔离</span></div>
             <div id="txtUrl" class="rows__sub">...</div>
           </div>
           <button type="button" class="btn btn--secondary btn--sm" onclick="copyText('txtUrl', this)">复制地址</button>
@@ -2288,6 +2665,9 @@ let ws = null;
 let llmFormInitialized = false;
 let allChannels = [];
 let activeUpstreamUrl = '';
+let activeSessions = [];
+let cachedBaseUrl = '';
+let selectedClientTag = '';
 let isSidecarActive = false;
 let subHistory = [];
 let currentSentenceMode = 'full_sentence';
@@ -2447,9 +2827,12 @@ function renderChannelList() {
   const mergedList = Array.from(groupedMap.values());
   document.getElementById('chCountBadge').textContent = `${mergedList.length} 频道 · ${filtered.length} 源`;
 
+  const activeUrls = new Set(activeSessions.map(s => s.upstream_url).filter(Boolean));
+  if (isSidecarActive && activeUpstreamUrl) activeUrls.add(activeUpstreamUrl);
+
   mergedList.forEach(item => {
     const li = document.createElement('li');
-    const activeIdx = isSidecarActive ? item.sources.findIndex(s => s.url === activeUpstreamUrl) : -1;
+    const activeIdx = isSidecarActive ? item.sources.findIndex(s => activeUrls.has(s.url)) : -1;
     const isCurrent = activeIdx !== -1;
     const dot = isCurrent ? '<span class="status-dot is-live"></span>' : '';
     const callsign = getChannelCallsign(item.name, item.group);
@@ -2494,13 +2877,83 @@ function renderChannelList() {
   });
 }
 
+function updateSubscriptionUrls() {
+  if (!cachedBaseUrl) return;
+  const pfx = selectedClientTag ? `/${selectedClientTag}` : '';
+  document.getElementById('tvboxUrl').textContent = `${cachedBaseUrl}${pfx}/tvbox.json`;
+  document.getElementById('m3uUrl').textContent = `${cachedBaseUrl}${pfx}/playlist.m3u`;
+  document.getElementById('txtUrl').textContent = `${cachedBaseUrl}${pfx}/playlist.txt`;
+  const hintEl = document.getElementById('apkHostHint');
+  if (hintEl) {
+    const bareHost = cachedBaseUrl.replace(/^https?:\/\//, '');
+    hintEl.textContent = selectedClientTag
+      ? `二级路由 NAT 下电视 APK 网关填 ${bareHost}/${selectedClientTag}`
+      : '同局域网各设备按 IP 自动隔离';
+  }
+}
+
+function setClientTag(tag) {
+  selectedClientTag = tag;
+  document.querySelectorAll('#clientTagSeg .tab').forEach(btn => {
+    btn.setAttribute('aria-selected', btn.dataset.tag === tag ? 'true' : 'false');
+  });
+  updateSubscriptionUrls();
+}
+
+function renderActiveSessionsBar(sessions, maxSessions) {
+  const bar = document.getElementById('activeSessionsBar');
+  if (!bar) return;
+  if (!sessions || sessions.length === 0) {
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    return;
+  }
+  bar.style.display = 'flex';
+  bar.innerHTML = '';
+  sessions.forEach(s => {
+    const pill = document.createElement('span');
+    pill.style.cssText = 'display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 8px 0 10px; border:1px solid var(--line-strong); border-radius:6px; background:var(--bg); font-size:12.5px;';
+    const dot = document.createElement('span');
+    dot.className = 'status-dot is-live';
+    const nameEl = document.createElement('span');
+    nameEl.style.fontWeight = '500';
+    nameEl.textContent = s.channel_name || s.channel_key;
+    const metaEl = document.createElement('span');
+    metaEl.className = 'mono muted';
+    metaEl.style.fontSize = '11.5px';
+    metaEl.textContent = s.viewer_count > 0 ? `${s.viewer_count}终端` : (s.manual_pinned ? '手动锁定' : '监听');
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.style.cssText = 'border:0; background:transparent; color:var(--muted); cursor:pointer; padding:0 2px; font-size:14px; line-height:1;';
+    closeBtn.textContent = '×';
+    closeBtn.title = '仅停止该路外语监听';
+    closeBtn.onclick = () => stopSession(s.channel_key);
+    pill.append(dot, nameEl, metaEl, closeBtn);
+    bar.appendChild(pill);
+  });
+}
+
 async function loadStatus() {
   const res = await fetch('/api/status');
   const data = await res.json();
-  document.getElementById('txtUrl').textContent = data.txt_url;
-  document.getElementById('m3uUrl').textContent = data.m3u_url;
+  cachedBaseUrl = data.base_url || '';
+  updateSubscriptionUrls();
   document.getElementById('epgUrl').textContent = data.epg_xml_url;
   document.getElementById('tvBadge').textContent = data.tv_clients_connected;
+
+  activeSessions = data.active_sessions || [];
+  const maxSess = data.max_sessions || 3;
+  const slotBadge = document.getElementById('slotBadge');
+  if (slotBadge) {
+    slotBadge.textContent = `${activeSessions.length}/${maxSess} 路`;
+  }
+  const slotWrap = document.getElementById('slotStatWrap');
+  if (slotWrap && data.hardware) {
+    const hw = data.hardware;
+    const ramInfo = hw.ram_total_gb ? ` · ${hw.ram_total_gb} GB RAM` : '';
+    slotWrap.title = `${hw.cpu_model} (${hw.cpu_logical_cores}T)${ramInfo}`;
+  }
+  renderActiveSessionsBar(activeSessions, maxSess);
 
   const sc = data.sidecar;
   isSidecarActive = sc.active;
@@ -2652,6 +3105,11 @@ async function pinChannel(id, name, url) {
   setTimeout(loadStatus, 350);
 }
 
+async function stopSession(channelKey) {
+  await fetch(`/api/stop?channel_key=${encodeURIComponent(channelKey)}`, {method: 'POST'});
+  setTimeout(loadStatus, 250);
+}
+
 async function stopTap() {
   await fetch('/api/stop', {method: 'POST'});
   setTimeout(loadStatus, 250);
@@ -2662,7 +3120,8 @@ async function sendTestSub() {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       en: 'Good evening, breaking news from our live broadcast studio as global markets react to the central bank decision.',
-      zh: ''
+      zh: '',
+      client_tag: selectedClientTag
     })
   });
 }
@@ -2675,16 +3134,16 @@ function copyText(id, btn) {
   setTimeout(() => { btn.textContent = old; }, 1400);
 }
 
-function pushHistory(en, zh) {
+function pushHistory(en, zh, chName) {
   if (!zh) return;
-  if (subHistory.length > 0 && subHistory[0].zh === zh) return;
-  subHistory.unshift({en, zh, time: new Date().toLocaleTimeString()});
+  if (subHistory.length > 0 && subHistory[0].zh === zh && subHistory[0].ch === chName) return;
+  subHistory.unshift({en, zh, ch: chName || '', time: new Date().toLocaleTimeString()});
   if (subHistory.length > 8) subHistory.pop();
   const box = document.getElementById('historyBox');
   box.style.display = 'block';
   box.innerHTML = subHistory.map(item =>
     `<li>
-       <div><span style="font-weight:500; color:var(--ink);">${item.zh}</span> <span class="muted" style="margin-left:8px;">${item.en}</span></div>
+       <div>${item.ch ? `<span class="src-badge" style="margin-right:6px;">${item.ch}</span>` : ''}<span style="font-weight:500; color:var(--ink);">${item.zh}</span> <span class="muted" style="margin-left:8px;">${item.en}</span></div>
        <span class="mono muted" style="font-size:11.5px;">${item.time}</span>
      </li>`
   ).join('');
@@ -2692,14 +3151,17 @@ function pushHistory(en, zh) {
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws/subtitles`);
+  ws = new WebSocket(`${proto}//${location.host}/ws/subtitles?role=console`);
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
     const zhEl = document.getElementById('subZh');
     if (msg.type === 'subtitle' || msg.type === 'status') {
       if (msg.type === 'subtitle') {
-        pushHistory(msg.en || '', msg.zh || '');
+        pushHistory(msg.en || '', msg.zh || '', msg.channel || '');
         zhEl.className = 'sub-zh';
+        if (msg.channel && activeSessions.length > 1) {
+          document.getElementById('stageChannelTag').textContent = `${msg.channel} (${activeSessions.length}路并发)`;
+        }
         const vuEl = document.getElementById('vuMeter');
         if (vuEl && !vuEl.classList.contains('is-live')) {
           vuEl.classList.add('is-live');
