@@ -546,3 +546,242 @@ def test_multi_client_concurrent_isolation_and_same_channel_sharing() -> None:
             )
             assert ws_ip1.receive_json()["zh"] == "来自威斯敏斯特的突发新闻。"
             pool.stop_current()
+
+
+def test_precision_pts_closed_loop_sync_and_holdback() -> None:
+    import asyncio
+    import time
+    from unittest.mock import patch
+
+    import httpx
+
+    from server.ai_pipeline import StreamingSpeechPipeline, SubtitleEvent
+    from server.main import _seg_cache, get_sidecar
+    from server.stream_proxy import (
+        AudioSidecarManager,
+        ClientPlayheadTracker,
+        HlsTimelineClock,
+        apply_m3u8_holdback,
+        rewrite_m3u8_manifest,
+    )
+
+    # 1. Layer 1: Sample-accurate speech-onset timestamping & uncapped long-sentence elapsed calculation
+    pipe = StreamingSpeechPipeline()
+    pipe.reset_stream(channel_name="Al Jazeera English")
+    pipe._stream_samples_cursor = 88000  # 5.5s
+    pipe._append_clause_to_pending(
+        "In Doha tonight, international mediators announced that.",
+        now=1000.0,
+        seg_start_sample=32000,  # Exact onset at 2.000s
+        seg_end_sample=83200,
+    )
+    pipe._stream_samples_cursor = 152000  # 9.500s (7.5s of audio elapsed since 2.000s onset!)
+    pipe._append_clause_to_pending(
+        "Talks will resume tomorrow morning with all delegations present.",
+        now=1004.0,
+        seg_start_sample=88000,
+        seg_end_sample=144000,  # Ends at 9.000s
+    )
+    ev_long = pipe._flush_pending_to_event()
+    assert ev_long is not None
+    assert ev_long.audio_onset_sec == 2.0
+    assert ev_long.audio_end_sec == 9.0
+    assert ev_long.pipeline_elapsed_ms >= 7500.0, (
+        f"Long 7.5s utterance must NOT be capped at 1200ms, got {ev_long.pipeline_elapsed_ms}"
+    )
+
+    # 2. Layer 2a: Unified HlsTimelineClock across 1080p video & 64k audio variants (PDT + MediaSeq)
+    pdt_clock = HlsTimelineClock()
+    tv_1080p_m3u8 = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:900
+#EXT-X-PROGRAM-DATE-TIME:2026-11-15T12:00:00.000Z
+#EXTINF:6.000,
+seg_900.ts?sig=tvA
+#EXTINF:6.000,
+seg_901.ts?sig=tvB
+#EXTINF:6.000,
+seg_902.ts?sig=tvC
+"""
+    ff_audio_m3u8 = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:10
+#EXT-X-PROGRAM-DATE-TIME:2026-11-15T12:00:06.000Z
+#EXTINF:6.000,
+aud_10.aac?sig=ffX
+#EXTINF:6.000,
+aud_11.aac?sig=ffY
+"""
+    pdt_clock.ingest_manifest("https://cdn.aje.net/1080p/index.m3u8", tv_1080p_m3u8)
+    pdt_clock.ingest_manifest("https://cdn.aje.net/audio/index.m3u8", ff_audio_m3u8)
+    pts_tv_901 = pdt_clock.lookup_segment_pts("https://cdn.aje.net/1080p/seg_901.ts?sig=fresh_token")
+    pts_ff_10 = pdt_clock.lookup_segment_pts("https://cdn.aje.net/audio/aud_10.aac?sig=other_token")
+    assert pts_tv_901 is not None and pts_ff_10 is not None
+    assert abs(pts_tv_901 - pts_ff_10) < 0.001
+
+    # 3. Layer 3: Adaptive M3U8 Hold-Back Gate (2s short segments vs 10s long segments & >=4 floor)
+    short_seg_m3u8 = (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:500\n"
+        + "".join(f"#EXTINF:2.000,\nchunk_{500 + i}.ts\n" for i in range(9))
+    )
+    held_m3u8, held_k = apply_m3u8_holdback(short_seg_m3u8, target_lead_sec=9.5)
+    assert held_k == 3
+    assert "#EXT-X-MEDIA-SEQUENCE:500" in held_m3u8
+    assert "chunk_500.ts" in held_m3u8
+    assert "chunk_505.ts" in held_m3u8
+    assert "chunk_506.ts" not in held_m3u8  # Last 3 tail segments held back cleanly
+
+    aje_10s_m3u8 = (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:80\n"
+        + "".join(f"#EXTINF:10.000,\naje_{80 + i}.ts\n" for i in range(6))
+    )
+    _, held_aje = apply_m3u8_holdback(aje_10s_m3u8, target_lead_sec=9.5)
+    assert held_aje == 0  # Long 10s segments already have >=10s natural lead -> 0 holdback!
+
+    tiny_4seg_m3u8 = (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n"
+        + "".join(f"#EXTINF:2.000,\ntiny_{1 + i}.ts\n" for i in range(4))
+    )
+    _, held_tiny = apply_m3u8_holdback(tiny_4seg_m3u8, target_lead_sec=9.5)
+    assert held_tiny == 0  # Never starve playlists with <= 4 segments!
+
+    rewritten_seg_m3u8 = rewrite_m3u8_manifest(
+        manifest_text=tv_1080p_m3u8,
+        final_upstream_url="https://cdn.aje.net/1080p/index.m3u8",
+        base_proxy_url="http://10.10.10.80:8765",
+        channel_id="aje01",
+        channel_name="Al Jazeera",
+        proxy_segments=True,
+        client_id="tv1",
+        timeline_clock=pdt_clock,
+    )
+    assert "/live/aje01/seg/seg_900.ts?u=" in rewritten_seg_m3u8
+    assert "&seq=900" in rewritten_seg_m3u8
+    assert "&dur=6.000" in rewritten_seg_m3u8
+    assert "&client=tv1" in rewritten_seg_m3u8
+
+    # 4. Playhead tracker physics: forward pre-fetch stability + causality rebuffer stall shift
+    tr = ClientPlayheadTracker(client_key="tag:tv1")
+    tr.on_segment_delivered(pts=100.0, dur=4.0, seq=10, done_wall=1000.0)
+    w_init = tr.predict_wall_time(110.0)  # Expected: 1000.12 + 10.0 = 1010.12
+    assert abs(w_init - 1010.12) < 0.05
+    # Immediate burst pre-fetch of seq 11 & 12 at t=1000.25 and t=1000.40 must NOT jump playhead!
+    tr.on_segment_delivered(pts=104.0, dur=4.0, seq=11, done_wall=1000.25)
+    tr.on_segment_delivered(pts=108.0, dur=4.0, seq=12, done_wall=1000.40)
+    assert abs(tr.predict_wall_time(110.0) - w_init) < 0.05
+    # Simulated 3.0s network rebuffer stall: seq 13 (pts=112.0) finishes late at t=1015.0 (Playhead 114.88 > 112.0)!
+    tr.on_segment_delivered(pts=112.0, dur=4.0, seq=13, done_wall=1015.0)
+    assert tr.stall_count == 1
+    assert abs(tr.predict_wall_time(114.0) - 1017.08) < 0.05  # Shifted cleanly by the exact stall!
+
+    # 5. End-to-end `/live/{cid}/seg/chunk.ts` pass-through + RAM cache + per-TV closed-loop WS scheduling
+    upstream_hits = 0
+    fake_ts_bytes = b"\x47" + b"\x00" * 187
+
+    def _mock_handler(req: httpx.Request) -> httpx.Response:
+        nonlocal upstream_hits
+        upstream_hits += 1
+        return httpx.Response(200, content=fake_ts_bytes, headers={"Content-Type": "video/mp2t"})
+
+    mock_async_client = httpx.AsyncClient(transport=httpx.MockTransport(_mock_handler))
+
+    async def _fake_get_http_client(_proxy=None):
+        return mock_async_client
+
+    with (
+        patch("server.main._get_seg_http_client", _fake_get_http_client),
+        patch.object(AudioSidecarManager, "_audio_tap_worker", lambda self, *a, **kw: time.sleep(1.2)),
+        patch.object(AudioSidecarManager, "_translation_worker", lambda self, *a, **kw: None),
+        TestClient(app) as client,
+    ):
+        try:
+            _seg_cache._store.clear()
+            pool = get_sidecar()
+            pool.stop_current()
+            pool.apply_settings(subtitle_delay_ms=800, auto_sync=True)  # 800ms = neutral 0ms fine-tune
+
+            with (
+                client.websocket_connect("/tv1/ws/subtitles") as ws_tv1,
+                client.websocket_connect("/tv2/ws/subtitles") as ws_tv2,
+            ):
+                assert ws_tv1.receive_json()["type"] == "connected"
+                assert ws_tv2.receive_json()["type"] == "connected"
+
+                async def _join_both():
+                    sc1 = await pool.touch_client_channel(
+                        client_key="tag:tv1",
+                        client_ip="10.10.10.21",
+                        client_tag="tv1",
+                        channel_id="aje_live",
+                        channel_name="Al Jazeera English",
+                        upstream_url="https://cdn.aje.net/live.m3u8",
+                    )
+                    await pool.touch_client_channel(
+                        client_key="tag:tv2",
+                        client_ip="10.10.10.22",
+                        client_tag="tv2",
+                        channel_id="aje_live",
+                        channel_name="Al Jazeera English",
+                        upstream_url="https://cdn.aje.net/live.m3u8",
+                    )
+                    return sc1
+
+                sc_aje = asyncio.run_coroutine_threadsafe(_join_both(), pool._loop).result(timeout=5)
+                assert ws_tv1.receive_json()["type"] == "clear"
+                assert ws_tv2.receive_json()["type"] == "clear"
+                # Drain join status message for second viewer
+                join_msg = ws_tv2.receive_json()
+                assert join_msg["type"] == "status"
+
+                seg_tok = encode_url_token("https://cdn.aje.net/1080p/chunk_700.ts")
+                t_ref = time.time()
+                # TV1 is at pts=500.0 right now; TV2 is 0.30s behind (pts=499.70 right now)
+                r_seg1 = client.get(
+                    f"/live/aje_live/seg/chunk_700.ts?u={seg_tok}&pts=500.000&dur=4.000&seq=700&client=tv1"
+                )
+                r_seg2 = client.get(
+                    f"/live/aje_live/seg/chunk_700.ts?u={seg_tok}&pts=499.700&dur=4.000&seq=700&client=tv2"
+                )
+                assert r_seg1.status_code == 200 and r_seg1.content == fake_ts_bytes
+                assert r_seg2.status_code == 200 and r_seg2.content == fake_ts_bytes
+                assert upstream_hits == 1, "Second TV fetching same .ts segment should hit SegmentRamCache!"
+
+                # Lock FFmpeg audio origin at pts=500.0; speech onset at +0.25s -> onset_pts = 500.25
+                # TV1 reaches 500.25 in ~0.37s (0.12s init + 0.25s); TV2 reaches 500.25 in ~0.67s!
+                with sc_aje._lock:
+                    sc_aje._audio_origin_pts = 500.0
+                    sc_aje._audio_origin_locked = True
+
+                t_emit = time.perf_counter()
+                sc_aje._handle_subtitle_event(
+                    SubtitleEvent(
+                        channel="Al Jazeera English",
+                        en="Good evening from Doha, here are tonight's top stories.",
+                        zh="多哈晚上好，以下是今晚的头条新闻。",
+                        is_final=True,
+                        timestamp=t_ref,
+                        latency_ms=420.0,
+                        pipeline_elapsed_ms=5400.0,
+                        audio_onset_sec=0.25,
+                        audio_end_sec=4.65,
+                    ),
+                    session_epoch=sc_aje._session_epoch,
+                )
+
+                m1 = ws_tv1.receive_json()
+                dt1 = time.perf_counter() - t_emit
+                m2 = ws_tv2.receive_json()
+                dt2 = time.perf_counter() - t_emit
+
+                assert m1["type"] == "subtitle" and m1["sync_mode"] == "pts_closed_loop"
+                assert m2["type"] == "subtitle" and m2["sync_mode"] == "pts_closed_loop"
+                assert 0.18 <= dt1 <= 0.60, f"TV1 subtitle arrived at {dt1:.3f}s outside closed-loop window"
+                assert (dt2 - dt1) >= 0.18, (
+                    f"TV2 (0.30s further buffered) must receive subtitle after TV1: dt1={dt1:.3f}s, dt2={dt2:.3f}s"
+                )
+        finally:
+            pool.stop_current()
+            asyncio.run(mock_async_client.aclose())
+

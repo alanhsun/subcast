@@ -39,6 +39,8 @@ class SubtitleEvent:
     latency_ms: float = 0.0
     engine_info: str = ""
     pipeline_elapsed_ms: float = 0.0
+    audio_onset_sec: Optional[float] = None
+    audio_end_sec: Optional[float] = None
 
 
 @dataclass
@@ -492,6 +494,10 @@ class StreamingSpeechPipeline:
         self._vad_remainder = np.zeros(0, dtype=np.float32)
         self._speech_accum = np.zeros(0, dtype=np.float32)
         self._rolling_rms: float = 0.04
+        self._stream_samples_cursor: int = 0
+        self._pending_onset_sample: Optional[int] = None
+        self._pending_end_sample: Optional[int] = None
+        self._vad_just_flushed: bool = False
         self._pending_clauses: List[str] = []
         self._pending_first_ts: float = 0.0
         self._pending_wait_samples: int = 0
@@ -538,6 +544,10 @@ class StreamingSpeechPipeline:
         sess._vad_remainder = np.zeros(0, dtype=np.float32)
         sess._speech_accum = np.zeros(0, dtype=np.float32)
         sess._rolling_rms = 0.04
+        sess._stream_samples_cursor = 0
+        sess._pending_onset_sample = None
+        sess._pending_end_sample = None
+        sess._vad_just_flushed = False
         sess._pending_clauses = []
         sess._pending_first_ts = 0.0
         sess._pending_wait_samples = 0
@@ -605,11 +615,20 @@ class StreamingSpeechPipeline:
                 if channel_name != self.channel_name:
                     self.llm_translator.clear_context()
                 self.channel_name = channel_name
+            self.reset_audio_clock()
+
+    def reset_audio_clock(self) -> None:
+        """Resets 16kHz PCM sample cursor and VAD/clause state on FFmpeg spawn/reconnect while preserving LLM context."""
+        with self._asr_lock:
             if self.vad is not None:
                 self.vad.reset()
             self._vad_remainder = np.zeros(0, dtype=np.float32)
             self._speech_accum = np.zeros(0, dtype=np.float32)
             self._rolling_rms = 0.04
+            self._stream_samples_cursor = 0
+            self._pending_onset_sample = None
+            self._pending_end_sample = None
+            self._vad_just_flushed = False
             self._pending_clauses = []
             self._pending_first_ts = 0.0
             self._pending_wait_samples = 0
@@ -697,7 +716,13 @@ class StreamingSpeechPipeline:
         # Default: "full_sentence"
         return (9, 28, 0.48, 5.5)
 
-    def _append_clause_to_pending(self, raw_clause: str, now: float) -> None:
+    def _append_clause_to_pending(
+        self,
+        raw_clause: str,
+        now: float,
+        seg_start_sample: Optional[int] = None,
+        seg_end_sample: Optional[int] = None,
+    ) -> None:
         clause = " ".join(raw_clause.strip().split())
         if not clause:
             return
@@ -705,6 +730,9 @@ class StreamingSpeechPipeline:
         if not self._pending_clauses:
             self._pending_first_ts = now
             self._pending_wait_samples = 0
+            self._pending_onset_sample = seg_start_sample
+        if seg_end_sample is not None:
+            self._pending_end_sample = seg_end_sample
 
         # Check if previous buffered clause ended WITHOUT terminal punctuation (i.e. mid-sentence continuation)
         # OR if the new clause starts with a lowercase letter (meaning ASR itself detected continuation)
@@ -793,10 +821,14 @@ class StreamingSpeechPipeline:
         combined = self._get_combined_pending_text()
         first_ts = self._pending_first_ts
         wait_samples = self._pending_wait_samples
+        onset_sample = self._pending_onset_sample
+        end_sample = self._pending_end_sample
         post_silence_ms = (self._samples_since_vad_pop / 16000.0) * 1000.0
         self._pending_clauses = []
         self._pending_first_ts = 0.0
         self._pending_wait_samples = 0
+        self._pending_onset_sample = None
+        self._pending_end_sample = None
         self._samples_since_vad_pop = 0
         stripped_core = re.sub(r"[\s.,?!;:。，？！；：、…—\-~～\"'“”‘’()（）]+", "", combined)
         if not combined or len(stripped_core) < 2 and not any("\u4e00" <= c <= "\u9fff" for c in stripped_core):
@@ -816,10 +848,18 @@ class StreamingSpeechPipeline:
             combined += "."
 
         now_ts = time.time()
-        audio_span_ms = (wait_samples / 16000.0) * 1000.0
-        wall_span_ms = max(0.0, (now_ts - first_ts) * 1000.0) if first_ts > 0 else 0.0
-        agg_span_ms = audio_span_ms if audio_span_ms > 0 else wall_span_ms
-        pre_llm_elapsed_ms = self._pending_last_asr_ms + post_silence_ms + min(1200.0, agg_span_ms * 0.35)
+        onset_sec = round(onset_sample / 16000.0, 3) if onset_sample is not None else None
+        end_sec = round(end_sample / 16000.0, 3) if end_sample is not None else None
+
+        # Sample-accurate pre-LLM elapsed calculation from exact speech onset sample to flush cursor
+        if onset_sample is not None and self._stream_samples_cursor >= onset_sample:
+            audio_since_onset_ms = ((self._stream_samples_cursor - onset_sample) / 16000.0) * 1000.0
+            pre_llm_elapsed_ms = audio_since_onset_ms + self._pending_last_asr_ms
+        else:
+            audio_span_ms = (wait_samples / 16000.0) * 1000.0
+            wall_span_ms = max(0.0, (now_ts - first_ts) * 1000.0) if first_ts > 0 else 0.0
+            agg_span_ms = audio_span_ms if audio_span_ms > 0 else wall_span_ms
+            pre_llm_elapsed_ms = self._pending_last_asr_ms + post_silence_ms + agg_span_ms
 
         if self.async_translate_mode:
             # Return immediately so FFmpeg audio reader & VAD never block on LLM HTTP latency
@@ -832,6 +872,8 @@ class StreamingSpeechPipeline:
                 latency_ms=0.0,
                 engine_info=self.last_asr_engine,
                 pipeline_elapsed_ms=round(pre_llm_elapsed_ms, 1),
+                audio_onset_sec=onset_sec,
+                audio_end_sec=end_sec,
             )
 
         t0 = time.perf_counter()
@@ -850,6 +892,8 @@ class StreamingSpeechPipeline:
             latency_ms=round(latency_ms, 1),
             engine_info=f"{self.last_asr_engine} + {self.llm_translator.last_used_engine}",
             pipeline_elapsed_ms=round(pipeline_elapsed_ms, 1),
+            audio_onset_sec=onset_sec,
+            audio_end_sec=end_sec,
         )
         if self.on_subtitle:
             self.on_subtitle(ev)
@@ -924,6 +968,7 @@ class StreamingSpeechPipeline:
             while idx + window_size <= len(buf):
                 win = buf[idx : idx + window_size]
                 idx += window_size
+                self._stream_samples_cursor += window_size
                 win_rms = float(np.sqrt(np.mean(win * win)))
                 self._rolling_rms = 0.92 * self._rolling_rms + 0.08 * max(0.005, win_rms)
 
@@ -943,6 +988,7 @@ class StreamingSpeechPipeline:
                         accum_sec >= 3.2 and win_rms < max(0.015, self._rolling_rms * 0.45)
                     ) or accum_sec >= 4.8:
                         self.vad.flush()
+                        self._vad_just_flushed = True
                         self._speech_accum = np.zeros(0, dtype=np.float32)
                         speaking_now = False
                 elif self._pending_clauses:
@@ -952,6 +998,11 @@ class StreamingSpeechPipeline:
                 while not self.vad.empty():
                     seg_samples = np.array(self.vad.front.samples, dtype=np.float32)
                     self.vad.pop()
+                    was_flushed = self._vad_just_flushed
+                    self._vad_just_flushed = False
+                    tail_silence = 0 if was_flushed else int(round(0.32 * sample_rate))
+                    seg_end_sample = max(0, self._stream_samples_cursor - tail_silence)
+                    seg_start_sample = max(0, seg_end_sample - len(seg_samples))
                     self._speech_accum = np.zeros(0, dtype=np.float32)
                     self._last_interim_en = ""
                     self._samples_since_vad_pop = 0
@@ -963,7 +1014,12 @@ class StreamingSpeechPipeline:
                     if not src_text or len(src_text.strip(" .,?!。，？！")) < 2:
                         continue
 
-                    self._append_clause_to_pending(src_text, now)
+                    self._append_clause_to_pending(
+                        src_text,
+                        now,
+                        seg_start_sample=seg_start_sample,
+                        seg_end_sample=seg_end_sample,
+                    )
                     if self._should_flush_pending(
                         now=now,
                         is_currently_speaking=self.vad.is_speech_detected(),
@@ -1002,9 +1058,16 @@ class StreamingSpeechPipeline:
                 while not self.vad.empty():
                     seg_samples = np.array(self.vad.front.samples, dtype=np.float32)
                     self.vad.pop()
+                    seg_end_sample = self._stream_samples_cursor
+                    seg_start_sample = max(0, seg_end_sample - len(seg_samples))
                     src_text = self._recognize_sensevoice(seg_samples)
                     if src_text and len(src_text.strip(" .,?!。，？！")) >= 2:
-                        self._append_clause_to_pending(src_text, now)
+                        self._append_clause_to_pending(
+                            src_text,
+                            now,
+                            seg_start_sample=seg_start_sample,
+                            seg_end_sample=seg_end_sample,
+                        )
                 if self._pending_clauses:
                     ev = self._flush_pending_to_event()
                     if ev is not None:

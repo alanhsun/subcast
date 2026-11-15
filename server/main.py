@@ -10,7 +10,9 @@ import json
 import os
 import platform
 import socket
+import threading
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -225,6 +227,7 @@ class ConnectionHub:
         manual_pinned: bool,
         active_session_count: int,
         message: dict,
+        exclude_clients: Optional[set[str]] = None,
     ) -> None:
         if not self.clients:
             return
@@ -232,6 +235,13 @@ class ConnectionHub:
         stale: List[WebSocket] = []
         for ws in list(self.clients):
             info = self.meta.get(ws)
+            if (
+                info is not None
+                and info.role != "console"
+                and exclude_clients
+                and info.client_key in exclude_clients
+            ):
+                continue
             deliver = False
             if info is None or info.role == "console":
                 deliver = True
@@ -303,9 +313,79 @@ DEFAULT_EPG_SOURCE_URL = (
     "https://epg.pw/xmltv/epg_US.xml.gz"
 )
 
+class SegmentRamCache:
+    """
+    Bounded in-memory LRU cache for recent foreign-channel HLS segments (max 8 items <= 4.5MB, 22s TTL).
+    Eliminates duplicate cross-border downloads when 2 TVs watch the same channel or a player retries.
+    """
+
+    def __init__(self, max_items: int = 8, max_item_bytes: int = 4_500_000, ttl_sec: float = 22.0) -> None:
+        self.max_items = max_items
+        self.max_item_bytes = max_item_bytes
+        self.ttl_sec = ttl_sec
+        self._store: OrderedDict[str, tuple[float, bytes, str]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, url: str) -> Optional[tuple[bytes, str]]:
+        now = time.monotonic()
+        with self._lock:
+            item = self._store.get(url)
+            if item is None:
+                return None
+            ts, body, ctype = item
+            if (now - ts) > self.ttl_sec:
+                self._store.pop(url, None)
+                return None
+            self._store.move_to_end(url)
+            return body, ctype
+
+    def put(self, url: str, body: bytes, content_type: str) -> None:
+        if not body or len(body) > self.max_item_bytes:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._store[url] = (now, body, content_type)
+            self._store.move_to_end(url)
+            while len(self._store) > self.max_items:
+                self._store.popitem(last=False)
+
+
 hub = ConnectionHub()
+_seg_cache = SegmentRamCache()
+_seg_http_pool: Optional[httpx.AsyncClient] = None
+_seg_http_pool_loop: Optional[asyncio.AbstractEventLoop] = None
+_seg_http_pool_proxy: str = ""
 _pipeline: Optional[StreamingSpeechPipeline] = None
 _sidecar: Optional[MultiSessionSidecarPool] = None
+
+
+async def _get_seg_http_client(stream_proxy: Optional[str] = None) -> httpx.AsyncClient:
+    """Returns a loop-bound persistent keep-alive HTTP client pool for zero-TLS-overhead HLS forwarding."""
+    global _seg_http_pool, _seg_http_pool_loop, _seg_http_pool_proxy
+    cur_loop = asyncio.get_running_loop()
+    norm_proxy = stream_proxy or ""
+    if (
+        _seg_http_pool is None
+        or _seg_http_pool.is_closed
+        or _seg_http_pool_loop is not cur_loop
+        or _seg_http_pool_proxy != norm_proxy
+    ):
+        old_pool = _seg_http_pool
+        _seg_http_pool = httpx.AsyncClient(
+            follow_redirects=True,
+            verify=False,
+            proxy=stream_proxy or None,
+            timeout=httpx.Timeout(connect=5.5, read=12.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_connections=48, max_keepalive_connections=24, keepalive_expiry=30.0),
+        )
+        _seg_http_pool_loop = cur_loop
+        _seg_http_pool_proxy = norm_proxy
+        if old_pool is not None and not old_pool.is_closed:
+            try:
+                await old_pool.aclose()
+            except Exception:
+                pass
+    return _seg_http_pool
 _channels: List[ChannelEntry] = []
 _raw_env_epg = os.environ.get("LINGUARELAY_EPG_URL", "").strip()
 _epg_source_url: str = (
@@ -454,6 +534,11 @@ async def lifespan(app: FastAPI):
 
     epg_task.cancel()
     sidecar.close()
+    if _seg_http_pool is not None and not _seg_http_pool.is_closed:
+        try:
+            await _seg_http_pool.aclose()
+        except Exception:
+            pass
     if udp_transport:
         udp_transport.close()
 
@@ -982,23 +1067,25 @@ async def proxy_hls_manifest(
     text = ""
     last_status = 502
     stream_proxy = sidecar.stream_proxy or None
-    async with httpx.AsyncClient(
-        follow_redirects=True, timeout=6.5, verify=False, proxy=stream_proxy
-    ) as http_client:
-        for try_url in urls_to_fetch:
-            try:
-                resp = await http_client.get(try_url, headers=headers)
-                last_status = resp.status_code
-                if resp.status_code < 400 and resp.text.strip():
-                    matched_source_url = try_url
-                    final_url = str(resp.url)
-                    text = resp.text
-                    break
-            except Exception:
-                continue
+    http_client = await _get_seg_http_client(stream_proxy)
+    for try_url in urls_to_fetch:
+        try:
+            resp = await http_client.get(try_url, headers=headers, timeout=6.5)
+            last_status = resp.status_code
+            if resp.status_code < 400 and resp.text.strip():
+                matched_source_url = try_url
+                final_url = str(resp.url)
+                text = resp.text
+                break
+        except Exception:
+            continue
 
     if not text:
         raise HTTPException(status_code=last_status, detail="Upstream M3U8 error across all sources")
+
+    manifest_to_rewrite = text
+    timeline_clock = None
+    proxy_segs = False
 
     if need_translate:
         ordered_candidates = [matched_source_url] + [
@@ -1014,20 +1101,163 @@ async def proxy_hls_manifest(
             candidate_urls=ordered_candidates,
             manifest_text=text,
         )
+        if "#EXTINF" in text.upper():
+            manifest_to_rewrite, timeline_clock = sidecar.prepare_client_media_manifest(
+                channel_id=channel_id,
+                channel_name=name,
+                final_url=final_url,
+                manifest_text=text,
+                client_key=client_key,
+            )
+            proxy_segs = True
 
     base_url = _resolve_base_url(request)
     rewritten = rewrite_m3u8_manifest(
-        manifest_text=text,
+        manifest_text=manifest_to_rewrite,
         final_upstream_url=final_url,
         base_proxy_url=base_url,
         channel_id=channel_id,
         channel_name=name,
+        proxy_segments=proxy_segs,
         client_id=client_tag,
+        timeline_clock=timeline_clock,
     )
     return Response(
         content=rewritten.encode("utf-8"),
         media_type="application/vnd.apple.mpegurl",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@app.get("/live/{channel_id}/seg/{seg_name}")
+async def proxy_hls_segment(
+    channel_id: str,
+    seg_name: str,
+    request: Request,
+    u: str = Query(..., description="Base64URL encoded upstream segment URL"),
+    pts: Optional[float] = Query(None, description="Segment start PTS seconds"),
+    dur: Optional[float] = Query(None, description="Segment duration seconds"),
+    seq: int = Query(-1, description="HLS media sequence"),
+    init: int = Query(0, description="1 if fMP4 #EXT-X-MAP init segment"),
+    name: str = Query("Live Channel", description="Channel display name"),
+    client: str = Query("", description="Optional client channel tag"),
+) -> Response:
+    """
+    Zero-transcode HLS media segment pass-through with persistent connection pooling + RAM LRU cache.
+    Avoids Android ExoPlayer cross-protocol HTTP->HTTPS 302 redirect failures while measuring the
+    exact wall-clock instant (`done_wall`) each segment finishes arriving at each TV client!
+    """
+    try:
+        upstream_url = decode_url_token(u)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid segment token: {exc}") from exc
+
+    client_ip = _extract_client_ip(request)
+    client_tag = sanitize_client_id(client)
+    client_key = make_client_key(client_ip, client_tag)
+    sidecar = get_sidecar()
+
+    for ch in _channels:
+        if ch.id == channel_id:
+            name = ch.name or name
+            break
+
+    range_hdr = request.headers.get("range", "").strip()
+    if not range_hdr:
+        cached = _seg_cache.get(upstream_url)
+        if cached is not None:
+            body, ctype = cached
+            if not init:
+                sidecar.record_client_segment(
+                    client_key=client_key,
+                    client_ip=client_ip,
+                    client_tag=client_tag,
+                    channel_id=channel_id,
+                    channel_name=name,
+                    pts=pts,
+                    dur=dur,
+                    seq=seq,
+                    done_wall=time.time(),
+                )
+            return Response(
+                content=body,
+                media_type=ctype,
+                headers={
+                    "Content-Length": str(len(body)),
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "public, max-age=20",
+                },
+            )
+
+    req_headers = {
+        "User-Agent": request.headers.get(
+            "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LinguaRelayTV/2.4"
+        )
+    }
+    if range_hdr:
+        req_headers["Range"] = range_hdr
+
+    http_client = await _get_seg_http_client(sidecar.stream_proxy or None)
+    try:
+        up_req = http_client.build_request("GET", upstream_url, headers=req_headers)
+        up_resp = await http_client.send(up_req, stream=True)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Segment upstream error: {exc}") from exc
+
+    if up_resp.status_code >= 400:
+        status_code = up_resp.status_code
+        await up_resp.aclose()
+        raise HTTPException(status_code=status_code, detail="Upstream segment HTTP error")
+
+    low_name = seg_name.lower()
+    default_ctype = (
+        "video/iso.segment"
+        if low_name.endswith((".m4s", ".mp4", ".cmfv", ".cmfa"))
+        else ("audio/aac" if low_name.endswith(".aac") else "video/mp2t")
+    )
+    media_type = up_resp.headers.get("content-type") or default_ctype
+    out_headers: dict[str, str] = {"Cache-Control": "public, max-age=20"}
+    for h_key in ("content-length", "content-range", "accept-ranges"):
+        if h_key in up_resp.headers:
+            out_headers[h_key.title()] = up_resp.headers[h_key]
+    resp_status = up_resp.status_code
+    can_cache = resp_status == 200 and not range_hdr
+
+    async def _seg_stream():
+        cache_buf: Optional[bytearray] = bytearray() if can_cache else None
+        eof_reached = False
+        try:
+            async for chunk in up_resp.aiter_bytes(chunk_size=65536):
+                if cache_buf is not None:
+                    if len(cache_buf) + len(chunk) <= _seg_cache.max_item_bytes:
+                        cache_buf.extend(chunk)
+                    else:
+                        cache_buf = None
+                yield chunk
+            eof_reached = True
+        finally:
+            await up_resp.aclose()
+            if eof_reached:
+                if cache_buf is not None and len(cache_buf) > 0:
+                    _seg_cache.put(upstream_url, bytes(cache_buf), media_type)
+                if not init:
+                    sidecar.record_client_segment(
+                        client_key=client_key,
+                        client_ip=client_ip,
+                        client_tag=client_tag,
+                        channel_id=channel_id,
+                        channel_name=name,
+                        pts=pts,
+                        dur=dur,
+                        seq=seq,
+                        done_wall=time.time(),
+                    )
+
+    return StreamingResponse(
+        _seg_stream(),
+        status_code=resp_status,
+        media_type=media_type,
+        headers=out_headers,
     )
 
 
@@ -2486,6 +2716,7 @@ WEB_CONSOLE_HTML = r"""<!DOCTYPE html>
           </span>
         </div>
         <div class="monitor-metrics">
+          <span id="metricSync">自动闭环</span>
           <span id="metricLead">缓冲 --</span>
           <span id="metricPipe">耗时 --</span>
           <span id="metricWait">补偿 --</span>
@@ -2921,7 +3152,8 @@ function renderActiveSessionsBar(sessions, maxSessions) {
     const metaEl = document.createElement('span');
     metaEl.className = 'mono muted';
     metaEl.style.fontSize = '11.5px';
-    metaEl.textContent = s.viewer_count > 0 ? `${s.viewer_count}终端` : (s.manual_pinned ? '手动锁定' : '监听');
+    const syncTag = s.sync_mode === 'pts_closed_loop' ? ' · PTS闭环' : '';
+    metaEl.textContent = (s.viewer_count > 0 ? `${s.viewer_count}终端` : (s.manual_pinned ? '手动锁定' : '监听')) + syncTag;
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
     closeBtn.style.cssText = 'border:0; background:transparent; color:var(--muted); cursor:pointer; padding:0 2px; font-size:14px; line-height:1;';
@@ -3174,6 +3406,10 @@ function connectWs() {
           const leadS = ((msg.stream_lead_ms || 3500) / 1000).toFixed(1);
           const pipeS = ((msg.pipeline_elapsed_ms || 0) / 1000).toFixed(2);
           const waitS = ((msg.actual_delay_ms || 0) / 1000).toFixed(2);
+          const syncLabel = msg.sync_mode === 'pts_closed_loop'
+            ? 'PTS闭环'
+            : (msg.sync_mode === 'manual' ? '手动固定' : '采样时钟');
+          document.getElementById('metricSync').textContent = syncLabel;
           document.getElementById('metricLead').textContent = `缓冲 ${leadS}s`;
           document.getElementById('metricPipe').textContent = `耗时 ${pipeS}s`;
           document.getElementById('metricWait').textContent = `补偿 ${waitS}s`;
@@ -3187,6 +3423,7 @@ function connectWs() {
       document.getElementById('subEn').textContent = '';
       zhEl.className = 'sub-zh placeholder';
       zhEl.textContent = '已停止监听';
+      document.getElementById('metricSync').textContent = '自动闭环';
       document.getElementById('metricLead').textContent = '缓冲 --';
       document.getElementById('metricPipe').textContent = '耗时 --';
       document.getElementById('metricWait').textContent = '补偿 --';
